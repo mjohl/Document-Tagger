@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -366,9 +367,26 @@ sealed class DocumentStore(TaggerSettings settings)
         using var db = Open();
         using (var command = db.CreateCommand())
         {
-            command.CommandText = """CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL UNIQUE, original_file_name TEXT NOT NULL, file_path TEXT NOT NULL, title TEXT NOT NULL, document_date TEXT NULL, sender TEXT NULL, addressee TEXT NULL, tags_json TEXT NOT NULL, keywords_json TEXT NOT NULL, summary TEXT NOT NULL, ocr_text TEXT NOT NULL, processed_at TEXT NOT NULL);""";
+            command.CommandText = """CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL UNIQUE, content_hash TEXT NULL, original_file_name TEXT NOT NULL, file_path TEXT NOT NULL, title TEXT NOT NULL, document_date TEXT NULL, sender TEXT NULL, addressee TEXT NULL, tags_json TEXT NOT NULL, keywords_json TEXT NOT NULL, summary TEXT NOT NULL, ocr_text TEXT NOT NULL, processed_at TEXT NOT NULL);""";
             command.ExecuteNonQuery();
         }
+
+        var hasContentHash = false;
+        using (var columns = db.CreateCommand())
+        {
+            columns.CommandText = "PRAGMA table_info(documents);";
+            using var reader = columns.ExecuteReader();
+            while (reader.Read()) hasContentHash |= string.Equals(reader.GetString(1), "content_hash", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!hasContentHash)
+        {
+            using var addColumn = db.CreateCommand();
+            addColumn.CommandText = "ALTER TABLE documents ADD COLUMN content_hash TEXT NULL;";
+            addColumn.ExecuteNonQuery();
+        }
+
+        BackfillContentHashes(db);
 
         using (var inspect = db.CreateCommand())
         {
@@ -388,20 +406,29 @@ sealed class DocumentStore(TaggerSettings settings)
             create.ExecuteNonQuery();
         }
     }
-    public bool HasSource(string sourcePath) { using var db = Open(); using var command = db.CreateCommand(); command.CommandText = "SELECT EXISTS(SELECT 1 FROM documents WHERE source_path=$source)"; command.Parameters.AddWithValue("$source", sourcePath); return Convert.ToInt32(command.ExecuteScalar()) == 1; }
+    public bool HasSource(string sourcePath)
+    {
+        var contentHash = ComputeContentHash(sourcePath);
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT EXISTS(SELECT 1 FROM documents WHERE source_path=$source OR content_hash=$hash)";
+        command.Parameters.AddWithValue("$source", sourcePath);
+        command.Parameters.AddWithValue("$hash", contentHash);
+        return Convert.ToInt32(command.ExecuteScalar()) == 1;
+    }
     public long Upsert(DocumentRecord r)
     {
         using var db = Open(); using var tx = db.BeginTransaction();
         long id;
         if (r.Id == 0)
         {
-            using var insert = Command(db, "INSERT INTO documents(source_path,original_file_name,file_path,title,document_date,sender,addressee,tags_json,keywords_json,summary,ocr_text,processed_at) VALUES($source,$original,$file,$title,$date,$sender,$addressee,$tags,$keywords,$summary,$ocr,$processed); SELECT last_insert_rowid();", r);
+            using var insert = Command(db, "INSERT INTO documents(source_path,content_hash,original_file_name,file_path,title,document_date,sender,addressee,tags_json,keywords_json,summary,ocr_text,processed_at) VALUES($source,$hash,$original,$file,$title,$date,$sender,$addressee,$tags,$keywords,$summary,$ocr,$processed); SELECT last_insert_rowid();", r);
             id = (long)(insert.ExecuteScalar() ?? 0L);
         }
         else
         {
             id = r.Id;
-            using var update = Command(db, "UPDATE documents SET source_path=$source,original_file_name=$original,file_path=$file,title=$title,document_date=$date,sender=$sender,addressee=$addressee,tags_json=$tags,keywords_json=$keywords,summary=$summary,ocr_text=$ocr,processed_at=$processed WHERE id=$id;", r);
+            using var update = Command(db, "UPDATE documents SET source_path=$source,content_hash=$hash,original_file_name=$original,file_path=$file,title=$title,document_date=$date,sender=$sender,addressee=$addressee,tags_json=$tags,keywords_json=$keywords,summary=$summary,ocr_text=$ocr,processed_at=$processed WHERE id=$id;", r);
             update.Parameters.AddWithValue("$id", id);
             update.ExecuteNonQuery();
         }
@@ -440,7 +467,37 @@ sealed class DocumentStore(TaggerSettings settings)
         using var reader = command.ExecuteReader(); var records = new List<DocumentRecord>(); while (reader.Read()) records.Add(Read(reader)); return records;
     }
     private SqliteConnection Open() { var db = new SqliteConnection(ConnectionString); db.Open(); return db; }
-    private static SqliteCommand Command(SqliteConnection db, string sql, DocumentRecord r) { var c = db.CreateCommand(); c.CommandText = sql; c.Parameters.AddWithValue("$source", r.SourcePath); c.Parameters.AddWithValue("$original", r.OriginalFileName); c.Parameters.AddWithValue("$file", r.FilePath); c.Parameters.AddWithValue("$title", r.Title); c.Parameters.AddWithValue("$date", (object?)r.DocumentDate?.ToString("yyyy-MM-dd") ?? DBNull.Value); c.Parameters.AddWithValue("$sender", (object?)r.Sender ?? DBNull.Value); c.Parameters.AddWithValue("$addressee", (object?)r.Addressee ?? DBNull.Value); c.Parameters.AddWithValue("$tags", JsonSerializer.Serialize(r.Tags)); c.Parameters.AddWithValue("$keywords", JsonSerializer.Serialize(r.Keywords)); c.Parameters.AddWithValue("$summary", r.Summary); c.Parameters.AddWithValue("$ocr", r.OcrText); c.Parameters.AddWithValue("$processed", r.ProcessedAt.ToString("O")); return c; }
+    private void BackfillContentHashes(SqliteConnection db)
+    {
+        var updates = new List<(long Id, string Hash)>();
+        using (var select = db.CreateCommand())
+        {
+            select.CommandText = "SELECT id, source_path, file_path FROM documents WHERE content_hash IS NULL;";
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                var sourcePath = reader.GetString(1);
+                var filePath = reader.GetString(2);
+                var path = File.Exists(sourcePath) ? sourcePath : filePath;
+                if (File.Exists(path)) updates.Add((reader.GetInt64(0), ComputeContentHash(path)));
+            }
+        }
+
+        foreach (var update in updates)
+        {
+            using var command = db.CreateCommand();
+            command.CommandText = "UPDATE documents SET content_hash=$hash WHERE id=$id;";
+            command.Parameters.AddWithValue("$hash", update.Hash);
+            command.Parameters.AddWithValue("$id", update.Id);
+            command.ExecuteNonQuery();
+        }
+    }
+    private static string ComputeContentHash(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream));
+    }
+    private static SqliteCommand Command(SqliteConnection db, string sql, DocumentRecord r) { var c = db.CreateCommand(); c.CommandText = sql; c.Parameters.AddWithValue("$source", r.SourcePath); c.Parameters.AddWithValue("$hash", ComputeContentHash(r.SourcePath)); c.Parameters.AddWithValue("$original", r.OriginalFileName); c.Parameters.AddWithValue("$file", r.FilePath); c.Parameters.AddWithValue("$title", r.Title); c.Parameters.AddWithValue("$date", (object?)r.DocumentDate?.ToString("yyyy-MM-dd") ?? DBNull.Value); c.Parameters.AddWithValue("$sender", (object?)r.Sender ?? DBNull.Value); c.Parameters.AddWithValue("$addressee", (object?)r.Addressee ?? DBNull.Value); c.Parameters.AddWithValue("$tags", JsonSerializer.Serialize(r.Tags)); c.Parameters.AddWithValue("$keywords", JsonSerializer.Serialize(r.Keywords)); c.Parameters.AddWithValue("$summary", r.Summary); c.Parameters.AddWithValue("$ocr", r.OcrText); c.Parameters.AddWithValue("$processed", r.ProcessedAt.ToString("O")); return c; }
     private static DocumentRecord Read(SqliteDataReader r) => new(r.GetInt64(r.GetOrdinal("id")), r.GetString(r.GetOrdinal("source_path")), r.GetString(r.GetOrdinal("original_file_name")), r.GetString(r.GetOrdinal("file_path")), r.GetString(r.GetOrdinal("title")), r.IsDBNull(r.GetOrdinal("document_date")) ? null : DateOnly.Parse(r.GetString(r.GetOrdinal("document_date"))), r.IsDBNull(r.GetOrdinal("sender")) ? null : r.GetString(r.GetOrdinal("sender")), r.IsDBNull(r.GetOrdinal("addressee")) ? null : r.GetString(r.GetOrdinal("addressee")), JsonSerializer.Deserialize<List<string>>(r.GetString(r.GetOrdinal("tags_json"))) ?? new(), JsonSerializer.Deserialize<List<string>>(r.GetString(r.GetOrdinal("keywords_json"))) ?? new(), r.GetString(r.GetOrdinal("summary")), r.GetString(r.GetOrdinal("ocr_text")), DateTimeOffset.Parse(r.GetString(r.GetOrdinal("processed_at"))));
 }
 
