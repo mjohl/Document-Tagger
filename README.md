@@ -1,27 +1,26 @@
 # Document Tagger
 
-Document Tagger is a private, localhost-only C# web app for organizing scanned PDFs. It watches a scans folder, renders each PDF page, runs OCR, asks a local Ollama model to extract metadata, and saves a cleaned copy into a categorized folder structure while keeping the original untouched.
+A private, localhost-only C# web app for organizing scanned PDFs. It watches a source folder, renders each page, runs OCR, asks a local Ollama model to extract metadata, and stores the processed document in a categorized folder structure without altering the original.
 
-It stores searchable metadata in SQLite and writes a readable `.metadata.json` sidecar beside each processed PDF.
+The app keeps a local SQLite search index and also writes a readable `.metadata.json` sidecar beside each processed PDF.
 
-## What it does
+## Features
 
-- Scans a configured folder for new PDF files
-- Renders each page to images with `pdftoppm`
-- Extracts text with Tesseract OCR
-- Sends the OCR text to Ollama for title, sender/addressee, date, category, tags, keywords, and summary
-- Copies the document into `Processed/<category>/<year>/` using a date-based filename
-- Keeps a local SQLite index for searching and browsing
-- Lets you edit metadata manually and reprocess an individual document
+- Finds new PDFs in a configured scans folder
+- Renders PDF pages to images with `pdftoppm`
+- Extracts OCR text with Tesseract
+- Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
+- Copies documents into a date- and category-based folder structure
+- Provides a browser UI for searching, reviewing, editing, and reprocessing documents
 
 ## Prerequisites
 
 - .NET SDK 10.0.401
 - [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases) so `pdftoppm` is available on PATH, or set `PdfToPpmPath` in `appsettings.json`
 - [Tesseract OCR for Windows](https://github.com/UB-Mannheim/tesseract/wiki) so `tesseract.exe` is available on PATH, or set `TesseractPath` in `appsettings.json`
-- Ollama running locally, with the model configured in `appsettings.json`
+- Ollama running locally with a model available for the app settings
 
-Example:
+Install the default model used by the app:
 
 ```powershell
 ollama pull llama3.1
@@ -29,7 +28,7 @@ ollama pull llama3.1
 
 ## Configuration
 
-The app settings live in `appsettings.json` under the `DocumentTagger` section.
+The settings live in `appsettings.json` under the `DocumentTagger` section:
 
 ```json
 {
@@ -46,14 +45,14 @@ The app settings live in `appsettings.json` under the `DocumentTagger` section.
 }
 ```
 
-Key settings:
+Common settings:
 
-- `ScansDirectory`: the input folder that is searched for new PDFs
-- `ProcessedDirectory`: destination for completed documents
-- `DatabaseDirectory`: SQLite database folder; the app stores `documents.db` there
-- `OllamaUrl` and `OllamaModel`: local Ollama endpoint and model used for extraction
-- `PdfToPpmPath` and `TesseractPath`: OCR/render executables
-- `RenderDpi`: page rendering resolution for OCR quality
+- `ScansDirectory`: where new PDFs are discovered
+- `ProcessedDirectory`: where processed PDFs are saved
+- `DatabaseDirectory`: folder for the SQLite database (`documents.db`)
+- `OllamaUrl` and `OllamaModel`: local Ollama endpoint and model name
+- `PdfToPpmPath` and `TesseractPath`: paths to the render and OCR engines
+- `RenderDpi`: OCR rendering resolution
 
 ## Run
 
@@ -61,64 +60,64 @@ Key settings:
 dotnet run
 ```
 
-Open the local URL printed by ASP.NET (typically `http://localhost:5000` or similar) in a browser.
+Then open the local URL shown in the terminal, typically on `http://localhost:5000`.
 
-## How the app works
+## Workflow
 
-From the home page, click **Process scans** to process every unindexed PDF in the scans directory. The originals are never modified or moved.
+From the home page, click **Process scans** to process every new PDF in the scans folder. The original file is left untouched.
 
-Completed PDFs are saved into:
+Processed documents are saved under:
 
 ```text
 C:\Users\pharl\Scans\Processed\<category>\<year>\
 ```
 
-Examples of categories include `Bills`, `Legal`, `Medical`, `Appointments`, and `Government`.
+Typical categories include `Bills`, `Legal`, `Medical`, `Appointments`, and `Government`.
 
-Each file is renamed to a date-based pattern such as:
+Files are renamed with a date prefix, for example:
 
 ```text
 2026-08-12 - TV Licence - Permissions and Limitations.pdf
 ```
 
-If multiple documents share the same date and title, the app adds a numeric suffix.
+If the same date and title occur multiple times, the app adds a numeric suffix.
 
 ## Search and metadata editing
 
-The interface supports searching by:
+The web UI can search by:
 
 - title
 - sender or addressee
-- tag
-- document date range
+- tags
+- document date
 - keywords
 - summary text
-- OCR text content
+- OCR text
 
-Each processed document has a detail page where you can:
+Each processed document can be opened for:
 
-- open the PDF
-- edit title, sender, addressee, date, tags, keywords, summary, and OCR text
-- run **Reprocess** to re-run OCR and metadata extraction for that file
+- viewing the PDF
+- editing metadata fields such as title, sender, addressee, tags, keywords, summary, and OCR text
+- running **Reprocess** to refresh OCR and metadata extraction
 
-## Local data files
+## Local data
 
-The app keeps the working index in:
+The app stores its index in:
 
 ```text
 App_Data\documents.db
 ```
 
-It also writes a sidecar metadata file next to each processed PDF:
+It also writes a metadata sidecar next to each processed PDF:
 
 ```text
 filename.metadata.json
 ```
 
-These files are intentionally local-only and are not synced anywhere.
+This is intended for local use only and is not a cloud sync system.
 
 ## Notes
 
-- The app is designed for a single-person local workflow and does not require internet access beyond Ollama on `localhost`
-- If you change OCR settings, model settings, or extraction prompts, use **Reprocess** for affected documents
-- If `pdftoppm` or Tesseract are not on PATH, set their full path in `appsettings.json`
+- This is designed for a single-user local workflow and does not depend on a remote service beyond Ollama on localhost.
+- If you change model or OCR settings, re-run **Reprocess** on affected documents.
+- If `pdftoppm` or Tesseract are not on PATH, configure their full paths in `appsettings.json`.
