@@ -11,7 +11,7 @@ $settings = Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json
 $pdfToPpmPath = $settings.DocumentTagger.PdfToPpmPath
 if (-not (Test-Path -LiteralPath $pdfToPpmPath -PathType Leaf)) {
     throw "pdftoppm was not found at '$pdfToPpmPath'. Set DocumentTagger.PdfToPpmPath in appsettings.json to the full path of pdftoppm.exe."
-}
+}cd 
 
 $existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $wasRunning = $existingService -and $existingService.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running
