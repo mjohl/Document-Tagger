@@ -94,8 +94,51 @@ app.MapPost("/sign-out", async (HttpContext context) =>
 
 app.MapGet("/", (HttpRequest request, DocumentStore store) =>
 {
+    const int pageSize = 50;
     var query = DocumentQuery.Parse(request.Query);
-    return Results.Content(PageShell("Documents", SearchPage(store.Search(query), query, store.GetTags())), "text/html");
+    var colours = LabelColours.Effective(store.GetChosenColours());
+    string results;
+    if (query.IsCalendar)
+    {
+        // Open on the current month if it has documents, otherwise on the latest month that does.
+        var today = DateOnly.FromDateTime(DateTime.Today);
+        var thisMonth = new DateOnly(today.Year, today.Month, 1);
+        var month = query.MonthStart ?? (store.GetLatestCalendarDate(query, query.ByScanDate) is { } latest && latest < thisMonth ? new DateOnly(latest.Year, latest.Month, 1) : thisMonth);
+        query = query with { Month = month.ToString("yyyy-MM", CultureInfo.InvariantCulture) };
+        var firstShown = month.AddDays(-(((int)month.DayOfWeek + 6) % 7));
+        var lastOfMonth = month.AddMonths(1).AddDays(-1);
+        var lastShown = lastOfMonth.AddDays((7 - (int)lastOfMonth.DayOfWeek) % 7);
+        results = CalendarView(query, month, firstShown, lastShown, store.ListDocumentsBetween(query, firstShown, lastShown, query.ByScanDate), colours, today);
+    }
+    else
+    {
+        var (items, total) = store.ListDocuments(query, query.Page, pageSize);
+        results = ListView(query, items, total, pageSize, colours);
+    }
+    // Suggest tags used more than once plus the categories in use; one-off tags would bury the useful ones.
+    var suggestions = store.GetCategoryCounts().Select(category => category.Label).Concat(store.GetTagCounts(null, 80, 2).Select(tag => tag.Label))
+        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    return Results.Content(PageShell("Documents", HomePage(query, results, suggestions, store.CountReviews(ScanReview.Pending))), "text/html");
+});
+
+app.MapGet("/labels", (HttpRequest request, DocumentStore store) =>
+{
+    var search = request.Query["q"].ToString().Trim();
+    var colours = LabelColours.Effective(store.GetChosenColours());
+    var tags = store.GetTagCounts(search.Length == 0 ? null : search, 100);
+    return Results.Content(PageShell("Colours", LabelsPage(store.GetCategoryCounts(), tags, colours, search)), "text/html");
+});
+
+app.MapPost("/labels", async (HttpRequest request, DocumentStore store) =>
+{
+    var form = await request.ReadFormAsync();
+    var label = form["label"].ToString().Trim();
+    var colour = form["colour"].ToString();
+    var fromScript = request.Headers["X-Requested-With"] == "fetch";
+    if (label.Length is 0 or > 80 || !LabelColours.IsValid(colour))
+        return fromScript ? Results.BadRequest(new { error = "Choose a colour from the palette." }) : Results.Redirect("/labels");
+    store.SetColour(label, colour);
+    return fromScript ? Results.Json(new { label, colour }) : Results.Redirect($"/labels?q={Uri.EscapeDataString(form["q"].ToString())}");
 });
 
 app.MapPost("/api/chat", async (HttpContext http, ChatRequest request, DocumentStore store, ChatRetriever retriever, OllamaClient ollama) =>
@@ -140,25 +183,53 @@ app.MapPost("/api/chat", async (HttpContext http, ChatRequest request, DocumentS
 
 app.MapPost("/process", (ProcessingStatus status, IServiceScopeFactory scopeFactory) =>
 {
-    if (!status.TryBegin()) return Results.Redirect("/processing");
-    _ = Task.Run(async () =>
-    {
-        try
-        {
-            using var scope = scopeFactory.CreateScope();
-            var result = await scope.ServiceProvider.GetRequiredService<DocumentProcessor>().ProcessPendingAsync(status.Report);
-            status.Complete(result);
-        }
-        catch (Exception ex) { status.Fail($"Processing stopped: {ex.Message}"); }
-    });
+    StartProcessing(status, scopeFactory);
     return Results.Redirect("/processing");
+});
+
+app.MapGet("/reviews", (HttpRequest request, DocumentStore store) =>
+{
+    var reviews = store.GetReviews(ScanReview.Pending)
+        .Where(review => File.Exists(review.SourcePath))
+        .Select(review => (Review: review, Existing: store.Get(review.DuplicateOfId)))
+        .ToList();
+    return Results.Content(PageShell("Possible duplicates", ReviewsPage(reviews, request.Query["message"], Path.Combine(settings.ScansDirectory, DocumentProcessor.DuplicatesFolderName))), "text/html");
+});
+
+app.MapGet("/reviews/{id:long}/file", (long id, DocumentStore store) =>
+{
+    var review = store.GetReview(id);
+    return review is null || !File.Exists(review.SourcePath)
+        ? Results.NotFound()
+        : Results.File(review.SourcePath, "application/pdf", enableRangeProcessing: true);
+});
+
+app.MapPost("/reviews/{id:long}/discard", (long id, DocumentProcessor processor) =>
+    Results.Redirect($"/reviews?message={Uri.EscapeDataString(processor.DiscardDuplicate(id))}"));
+
+app.MapPost("/reviews/{id:long}/process", (long id, DocumentStore store, ProcessingStatus status, IServiceScopeFactory scopeFactory) =>
+{
+    var review = store.GetReview(id);
+    if (review is null || !File.Exists(review.SourcePath))
+        return Results.Redirect($"/reviews?message={Uri.EscapeDataString("That scan is no longer waiting for review.")}");
+    store.SetReviewStatus(id, ScanReview.Approved);
+    // A run already in progress picks up approved scans before it finishes.
+    return StartProcessing(status, scopeFactory)
+        ? Results.Redirect("/processing")
+        : Results.Redirect($"/reviews?message={Uri.EscapeDataString($"{review.FileName} was added to the processing run that is already in progress.")}");
 });
 
 app.MapGet("/processing", (OllamaModelSelection models) => Results.Content(PageShell("Processing scans", ProcessingPage(models.CurrentModel)), "text/html"));
 app.MapGet("/api/processing", (ProcessingStatus status, DocumentStore store) =>
 {
     var snapshot = status.Snapshot();
-    return Results.Json(new { snapshot.Running, snapshot.Completed, snapshot.Total, snapshot.Message, index = store.GetIndexStatus(settings.EmbeddingModel).Message });
+    return Results.Json(new
+    {
+        snapshot.Running, snapshot.Completed, snapshot.Total, snapshot.Message,
+        snapshot.File, snapshot.Step, snapshot.Detail, snapshot.Page, snapshot.Pages, snapshot.StepFraction, snapshot.Results,
+        index = store.GetIndexStatus(settings.EmbeddingModel).Message,
+        reviews = store.CountReviews(ScanReview.Pending)
+    });
 });
 app.MapGet("/api/ollama/models", async (OllamaClient ollama, OllamaModelSelection selection, CancellationToken cancellationToken) =>
 {
@@ -224,7 +295,7 @@ app.MapGet("/documents/{id:long}", (long id, HttpRequest request, DocumentStore 
     var document = store.Get(id);
     return document is null
         ? Results.NotFound("Document not found")
-        : Results.Content(PageShell(document.Title, DetailPage(document, request.Query["message"])), "text/html");
+        : Results.Content(PageShell(document.Title, DetailPage(document, request.Query["message"], LabelColours.Effective(store.GetChosenColours()))), "text/html");
 });
 
 app.MapGet("/documents/{id:long}/edit", (long id, HttpRequest request, DocumentStore store) =>
@@ -275,20 +346,117 @@ app.MapGet("/health", async (OllamaClient ollama, DocumentStore store) =>
 
 app.Run();
 
-static string SearchPage(IReadOnlyList<DocumentRecord> documents, DocumentQuery query, IReadOnlyList<string> tags)
+static string TagChip(string tag, IReadOnlyDictionary<string, string> colours) =>
+    $"<a class='tag{LabelColours.ChipClass(LabelColours.For(tag, colours))}' href='/?tag={Uri.EscapeDataString(tag)}'>{H(tag)}</a>";
+
+static string CategoryChip(string? category, IReadOnlyDictionary<string, string> colours) => category is null ? "" :
+    $"<a class='tag category{LabelColours.ChipClass(LabelColours.For(category, colours))}' href='/?tag={Uri.EscapeDataString(category)}' title='Category'>{H(category)}</a>";
+
+/// <summary>The home page filters as hidden fields, so a form that changes one setting keeps the rest.</summary>
+static string HiddenFilters(DocumentQuery query, params string[] except)
 {
-    var message = query.Message is { Length: > 0 } ? $"<div class='notice'>{H(query.Message)}</div>" : "";
-    var options = string.Join("", tags.Select(t => $"<option value='{A(t)}' {(query.Tag == t ? "selected" : "")}>{H(t)}</option>"));
+    var fields = new (string Name, string? Value)[] { ("name", query.Name), ("content", query.Content), ("tag", query.Tag), ("from", query.From), ("to", query.To), ("scanned", query.Scanned), ("view", query.IsCalendar ? "calendar" : null), ("by", query.ByScanDate ? "scanned" : null), ("month", query.IsCalendar ? query.Month : null) };
+    return string.Join("", fields.Where(field => !string.IsNullOrWhiteSpace(field.Value) && !except.Contains(field.Name)).Select(field => $"<input type='hidden' name='{field.Name}' value='{A(field.Value)}'>"));
+}
+
+static string ListView(DocumentQuery query, IReadOnlyList<DocumentListItem> documents, int total, int pageSize, IReadOnlyDictionary<string, string> colours)
+{
     // The title goes in a data attribute rather than inline JavaScript, so OCR-derived titles cannot break out of the script.
     // Column classes and data-labels let the same table render as cards on narrow screens.
     var rows = string.Join("", documents.Select(d =>
-        $"<tr><td class='col-name'><a href='/documents/{d.Id}'>{H(d.Title)}</a><small>{H(d.OriginalFileName)}</small></td>" +
-        $"<td class='col-date' data-label='Date'>{H(d.DocumentDate?.ToString("yyyy-MM-dd") ?? "—")}</td><td class='col-to col-people' data-label='To'>{H(d.Addressee ?? "—")}</td><td class='col-from col-people' data-label='From'>{H(d.Sender ?? "—")}</td>" +
-        $"<td class='col-tags'>{string.Join(" ", d.Tags.Select(t => $"<span class='tag'>{H(t)}</span>"))}</td>" +
-        $"<td class='col-summary'>{H(Trim(d.Summary, 130))}</td><td class='col-ai'><button type='button' class='document-chat' data-id='{d.Id}' data-title='{A(d.Title)}'>Ask AI</button></td></tr>"));
-    if (rows.Length == 0) rows = "<tr><td colspan='7' class='empty'>No processed documents match your search.</td></tr>";
+    {
+        var date = d.DocumentDate is { } documentDate
+            ? H(documentDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
+            : $"—{(d.ScannedDate is { } scanned ? $"<small>Scanned {scanned:yyyy-MM-dd}</small>" : "")}";
+        return $"<tr class='doc-row{LabelColours.AccentClass(LabelColours.ForDocument(d.Tags, d.Category, colours))}'><td class='col-name'><a href='/documents/{d.Id}'>{H(d.Title)}</a><small>{H(d.OriginalFileName)}</small></td>" +
+            $"<td class='col-date' data-label='Date'>{date}</td><td class='col-to col-people' data-label='To'>{H(d.Addressee ?? "—")}</td><td class='col-from col-people' data-label='From'>{H(d.Sender ?? "—")}</td>" +
+            $"<td class='col-tags'>{CategoryChip(d.Category, colours)}{string.Join("", d.Tags.Select(tag => TagChip(tag, colours)))}</td>" +
+            $"<td class='col-summary'>{H(Trim(d.Summary, 130))}</td><td class='col-ai'><button type='button' class='document-chat' data-id='{d.Id}' data-title='{A(d.Title)}'>Ask AI</button></td></tr>";
+    }));
+    if (rows.Length == 0) rows = $"<tr><td colspan='7' class='empty'>{(query.HasFilters ? "No documents match your search." : "No documents yet. Put scans in the scans folder and click Process scans.")}</td></tr>";
+
+    var pages = Math.Max(1, (int)Math.Ceiling(total / (double)pageSize));
+    var page = Math.Min(query.Page, pages);
+    var first = total == 0 ? 0 : (page - 1) * pageSize + 1;
+    var count = total == 0 ? "0 documents" : $"Showing {first:N0}–{first + documents.Count - 1:N0} of {total:N0} document{(total == 1 ? "" : "s")}";
+    string PageLink(int target, string text, string rel) => target < 1 || target > pages
+        ? $"<span class='button disabled' aria-disabled='true'>{text}</span>"
+        : $"<a class='button' rel='{rel}' href='{A((query with { Page = target }).Url())}'>{text}</a>";
+    var pager = pages <= 1 ? "" :
+        $"<nav class='pager' aria-label='Pages'>{PageLink(1, "« First", "first")}{PageLink(page - 1, "‹ Previous", "prev")}<span class='pager-status'>Page {page:N0} of {pages:N0}</span>{PageLink(page + 1, "Next ›", "next")}{PageLink(pages, "Last »", "last")}</nav>";
+    return $"""
+        <p class='count'>{count}</p>
+        <div class='table-wrap'><table><thead><tr><th>Name</th><th>Date</th><th>To</th><th>From</th><th>Category and tags</th><th>Summary</th><th><span class='visually-hidden'>Actions</span></th></tr></thead><tbody>{rows}</tbody></table></div>
+        {pager}
+        """;
+}
+
+static string CalendarView(DocumentQuery query, DateOnly month, DateOnly firstShown, DateOnly lastShown, IReadOnlyList<DocumentListItem> documents, IReadOnlyDictionary<string, string> colours, DateOnly today)
+{
+    const int visiblePerDay = 3;
+    const int expandablePerDay = 20;
+    DateOnly? DayOf(DocumentListItem d) => query.ByScanDate ? d.ScannedDate : d.DocumentDate ?? d.ScannedDate;
+    var byDay = documents.Where(d => DayOf(d) is not null).GroupBy(d => DayOf(d)!.Value).ToDictionary(group => group.Key, group => group.ToList());
+    var inMonth = documents.Count(d => DayOf(d) is { } day && day.Year == month.Year && day.Month == month.Month);
+    var undated = query.ByScanDate ? 0 : documents.Count(d => d.DocumentDate is null && DayOf(d) is { } day && day.Year == month.Year && day.Month == month.Month);
+    var monthName = month.ToString("MMMM yyyy", CultureInfo.InvariantCulture);
+
+    string Entry(DocumentListItem d)
+    {
+        var fallback = !query.ByScanDate && d.DocumentDate is null;
+        var tooltip = $"{d.Title}{(d.Sender is null ? "" : " · from " + d.Sender)}{(fallback ? " · no document date, shown on its scan date" : "")}";
+        return $"<li><a class='cal-doc{LabelColours.AccentClass(LabelColours.ForDocument(d.Tags, d.Category, colours))}' href='/documents/{d.Id}' title='{A(tooltip)}'>{(fallback ? "<span class='cal-flag' aria-label='Scan date'>◷</span>" : "")}{H(d.Title)}</a></li>";
+    }
+
+    var cells = new StringBuilder();
+    for (var day = firstShown; day <= lastShown; day = day.AddDays(1))
+    {
+        var entries = byDay.GetValueOrDefault(day) ?? [];
+        var classes = "cal-day" + (day.Month != month.Month ? " other-month" : "") + (day == today ? " today" : "") + (entries.Count > 0 ? " has-docs" : "");
+        // A few extra documents open in place; a busy day (such as a first big import) links to the list for that day instead.
+        var dayList = query.ByScanDate
+            ? query with { View = "list", Page = 1, Scanned = day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) }
+            : query with { View = "list", Page = 1, From = day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), To = day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) };
+        var hidden = entries.Count - visiblePerDay;
+        var more = hidden <= 0 ? ""
+            : hidden <= expandablePerDay
+                ? $"<details class='cal-more'><summary>+{hidden} more</summary><ul class='cal-docs'>{string.Join("", entries.Skip(visiblePerDay).Select(Entry))}</ul></details>"
+                : $"<a class='cal-more-link' href='{A(dayList.Url())}'>+{hidden:N0} more</a>";
+        cells.Append($"<div class='{classes}'><div class='cal-date'><span class='cal-dow'>{day.ToString("ddd", CultureInfo.InvariantCulture)}</span><span class='cal-num'>{day.Day}</span><span class='cal-mon'>{day.ToString("MMM", CultureInfo.InvariantCulture)}</span></div>");
+        if (entries.Count > 0) cells.Append($"<ul class='cal-docs'>{string.Join("", entries.Take(visiblePerDay).Select(Entry))}</ul>{more}");
+        cells.Append("</div>");
+    }
+
+    string MonthLink(DateOnly target) => A((query with { Month = target.ToString("yyyy-MM", CultureInfo.InvariantCulture) }).Url());
+    string BasisLink(string by, string text) => $"<a href='{A((query with { By = by }).Url())}'{((by == "scanned") == query.ByScanDate ? " class='active' aria-current='true'" : "")}>{text}</a>";
+    var weekdays = string.Join("", new[] { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" }.Select(name => $"<div class='cal-weekday'>{name}</div>"));
+    var summary = $"{inMonth:N0} document{(inMonth == 1 ? "" : "s")} in {monthName}" +
+        (undated > 0 ? $" · {undated} without a document date {(undated == 1 ? "is" : "are")} shown on {(undated == 1 ? "its" : "their")} scan date (◷)" : "");
+    return $"""
+        <div class='calendar-bar'>
+          <div class='cal-nav'><a class='button' href='{MonthLink(month.AddMonths(-1))}' aria-label='Previous month'>‹</a><h2>{monthName}</h2><a class='button' href='{MonthLink(month.AddMonths(1))}' aria-label='Next month'>›</a></div>
+          <form class='cal-jump' method='get'>{HiddenFilters(query, "month")}<label class='visually-hidden' for='cal-month'>Go to month</label><input id='cal-month' type='month' name='month' value='{A(query.Month)}' onchange='this.form.requestSubmit()'><a class='button' href='{MonthLink(new DateOnly(today.Year, today.Month, 1))}'>Today</a></form>
+          <div class='segmented' aria-label='Place documents by'>{BasisLink("document", "Document date")}{BasisLink("scanned", "Scan date")}</div>
+        </div>
+        <p class='count'>{summary}</p>
+        <div class='calendar'>{weekdays}{cells}</div>
+        {(inMonth == 0 ? $"<p class='cal-empty'>No documents in {monthName}.</p>" : "")}
+        """;
+}
+
+static string HomePage(DocumentQuery query, string results, IReadOnlyList<string> suggestions, int pendingReviews)
+{
+    var message = query.Message is { Length: > 0 } ? $"<div class='notice'>{H(query.Message)}</div>" : "";
+    if (pendingReviews > 0)
+        message += $"<div class='notice review-notice' role='status'><span>{(pendingReviews == 1 ? "1 new scan looks like a document" : $"{pendingReviews} new scans look like documents")} you already have.</span><a class='button' href='/reviews'>Review {(pendingReviews == 1 ? "it" : "them")}</a></div>";
+    if (query.ScannedOn is { } scannedOn)
+        message += $"<div class='notice filter-notice' role='status'><span>Showing documents scanned on {scannedOn.ToString("d MMMM yyyy", CultureInfo.InvariantCulture)}.</span><a href='{A((query with { Scanned = null, Page = 1 }).Url())}'>Show all</a></div>";
+    var options = string.Join("", suggestions.Select(tag => $"<option value='{A(tag)}'></option>"));
     var activeFilters = new[] { query.Name, query.Content, query.Tag, query.From, query.To }.Count(value => !string.IsNullOrWhiteSpace(value));
     var filterSummary = activeFilters == 0 ? "Search and filter" : $"Search and filter <span class='filter-count'>{activeFilters} active</span>";
+    var listUrl = A((query with { View = "list", Page = 1 }).Url());
+    var calendarUrl = A((query with { View = "calendar", Page = 1 }).Url());
+    var clearUrl = A(new DocumentQuery(View: query.View, By: query.By, Month: query.IsCalendar ? query.Month : null).Url());
     return $$"""
         <div class='hero'><div><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Scanned documents</h1><p>OCR, tags and search stay on this computer.</p></div>
         <form method='post' action='/process'><button class='primary'>Process scans</button></form></div>{{message}}
@@ -297,20 +465,76 @@ static string SearchPage(IReadOnlyList<DocumentRecord> documents, DocumentQuery 
         <form id='chat-form' class='chat-form'><label class='visually-hidden' for='chat-question'>Question</label><textarea id='chat-question' rows='2' placeholder='e.g. When does my car insurance renew?' required></textarea>
         <div class='chat-buttons'><button class='primary' type='submit'>Ask Ollama</button><button type='button' id='chat-reset' class='button hidden'>New conversation</button></div></form></section>
         <details class='filter-panel'{{(activeFilters > 0 ? " open" : "")}}><summary>{{filterSummary}}</summary>
-        <form class='filters' method='get'>
+        <form class='filters' method='get'>{{HiddenFilters(query, "name", "content", "tag", "from", "to")}}
         <label class='filter-wide'>Name<input name='name' value='{{A(query.Name)}}' placeholder='Title, sender or addressee'></label>
         <label class='filter-wide'>Text<input name='content' value='{{A(query.Content)}}' placeholder='Words in the OCR text'></label>
-        <label>Tag<select name='tag'><option value=''>All tags</option>{{options}}</select></label>
+        <label>Tag or category<input name='tag' value='{{A(query.Tag)}}' list='tag-options' placeholder='e.g. Bills' autocomplete='off'><datalist id='tag-options'>{{options}}</datalist></label>
         <label>From date<input name='from' type='date' value='{{A(query.From)}}'></label>
         <label>To date<input name='to' type='date' value='{{A(query.To)}}'></label>
-        <div class='filter-actions'><button>Search</button><a class='clear' href='/'>Clear</a></div></form></details>
-        <p class='count'>{{documents.Count}} document{{(documents.Count == 1 ? "" : "s")}}</p>
-        <div class='table-wrap'><table><thead><tr><th>Name</th><th>Date</th><th>To</th><th>From</th><th>Tags</th><th>Summary</th><th><span class='visually-hidden'>Actions</span></th></tr></thead><tbody>{{rows}}</tbody></table></div>
+        <div class='filter-actions'><button>Search</button><a class='clear' href='{{clearUrl}}'>Clear</a></div></form></details>
+        <div class='view-bar'>
+          <nav class='segmented' aria-label='View'><a href='{{listUrl}}'{{(query.IsCalendar ? "" : " class='active' aria-current='page'")}}>List</a><a href='{{calendarUrl}}'{{(query.IsCalendar ? " class='active' aria-current='page'" : "")}}>Calendar</a></nav>
+          <a class='button colours-link' href='/labels'>Colours</a>
+        </div>
+        {{results}}
         <dialog id='document-chat' class='document-chat-dialog' aria-labelledby='document-chat-title'>
         <div class='dialog-head'><div><p class='eyebrow'>DOCUMENT ASSISTANT</p><h2 id='document-chat-title'>Document</h2></div><form method='dialog' class='dialog-close'><button aria-label='Close'>×</button></form></div>
         <div id='document-chat-thread' class='chat-thread' aria-live='polite'></div>
         <form id='document-chat-form' class='chat-form'><input type='hidden' id='document-chat-id'><label class='visually-hidden' for='document-chat-question'>Question about this document</label><textarea id='document-chat-question' rows='2' placeholder='Ask for an explanation, key dates, amounts or actions.' required></textarea><div class='chat-buttons'><button class='primary' type='submit'>Ask</button><button type='button' id='document-chat-reset' class='button hidden'>New conversation</button></div></form></dialog>
         """ + ChatScript();
+}
+
+static string LabelsPage(IReadOnlyList<(string Label, int Count)> categories, IReadOnlyList<(string Label, int Count)> tags, IReadOnlyDictionary<string, string> colours, string search)
+{
+    var row = 0;
+    string Row((string Label, int Count) item, bool isCategory)
+    {
+        row++;
+        var current = LabelColours.For(item.Label, colours);
+        var swatches = string.Join("", LabelColours.Palette.Select(swatch => (Name: swatch.Name, Title: swatch.Title)).Prepend((Name: LabelColours.None, Title: "No colour")).Select(option =>
+            $"<label class='swatch swatch-{option.Name}' title='{option.Title}'><input type='radio' name='colour' value='{option.Name}' aria-label='{option.Title}'{((current ?? LabelColours.None) == option.Name ? " checked" : "")}><span></span></label>"));
+        return $"""
+            <form class='label-row' method='post' action='/labels'>
+              <input type='hidden' name='label' value='{A(item.Label)}'><input type='hidden' name='q' value='{A(search)}'>
+              <div class='label-name'><span class='tag{(isCategory ? " category" : "")}{LabelColours.ChipClass(current)}' data-preview>{H(item.Label)}</span><a class='label-count' href='/?tag={Uri.EscapeDataString(item.Label)}'>{item.Count:N0} document{(item.Count == 1 ? "" : "s")}</a></div>
+              <fieldset class='swatches'><legend class='visually-hidden'>Colour for {H(item.Label)}</legend>{swatches}</fieldset>
+              <noscript><button type='submit'>Save</button></noscript>
+            </form>
+            """;
+    }
+    var categoryRows = categories.Count == 0 ? "<p class='hint'>No documents have a category yet.</p>" : string.Join("", categories.Select(category => Row(category, true)));
+    var tagRows = tags.Count == 0 ? $"<p class='hint'>{(search.Length > 0 ? $"No tags contain “{H(search)}”." : "No tags yet.")}</p>" : string.Join("", tags.Select(tag => Row(tag, false)));
+    return $$"""
+        <p><a class='back' href='/'>← All documents</a></p>
+        <div class='edit-heading'><p class='eyebrow'>LIBRARY SETTINGS</p><h1>Colours</h1>
+        <p>Colour categories and tags so different kinds of document stand out in the list and calendar. A document takes the colour of its first coloured tag, otherwise its category’s colour.</p></div>
+        <p id='label-status' class='label-status' role='status'></p>
+        <section><h2>Categories</h2><div class='label-list'>{{categoryRows}}</div></section>
+        <section><div class='section-head'><h2>Tags</h2>
+          <form class='label-search' method='get'><label class='visually-hidden' for='label-q'>Find a tag</label><input id='label-q' name='q' value='{{A(search)}}' placeholder='Find a tag'><button>Find</button></form></div>
+          <p class='hint'>{{(search.Length > 0 ? $"Tags containing “{H(search)}”, most used first." : "The 100 most used tags. Search to find others.")}}</p>
+          <div class='label-list'>{{tagRows}}</div></section>
+        <script>
+        // Each colour choice saves straight away; the preview chip changes to match.
+        const status = document.getElementById('label-status');
+        for (const form of document.querySelectorAll('.label-row')) {
+          form.addEventListener('change', async event => {
+            if (event.target.name !== 'colour') return;
+            const label = form.elements.label.value;
+            try {
+              const response = await fetch(form.action, {method: 'POST', headers: {'X-Requested-With': 'fetch'}, body: new URLSearchParams(new FormData(form))});
+              if (!response.ok) throw new Error();
+              const preview = form.querySelector('[data-preview]');
+              preview.className = preview.className.replace(/\bc-[a-z]+\b/g, '').trim();
+              if (event.target.value !== 'none') preview.classList.add('c-' + event.target.value);
+              status.textContent = `Saved the colour for “${label}”.`;
+            } catch {
+              status.textContent = `Could not save the colour for “${label}”. Try again.`;
+            }
+          });
+        }
+        </script>
+        """;
 }
 
 static string ChatScript() => """
@@ -474,13 +698,73 @@ static string ChatScript() => """
     </script>
     """;
 
-static string DetailPage(DocumentRecord d, string? message)
+static bool StartProcessing(ProcessingStatus status, IServiceScopeFactory scopeFactory)
+{
+    if (!status.TryBegin()) return false;
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var result = await scope.ServiceProvider.GetRequiredService<DocumentProcessor>().ProcessPendingAsync(status.Report, status.AddResult);
+            status.Complete(result);
+        }
+        catch (Exception ex) { status.Fail($"Processing stopped: {ex.Message}"); }
+    });
+    return true;
+}
+
+static string ReviewsPage(IReadOnlyList<(ScanReview Review, DocumentRecord? Existing)> items, string? message, string duplicatesFolder)
+{
+    var notice = string.IsNullOrWhiteSpace(message) ? "" : $"<div class='notice' role='status'>{H(message)}</div>";
+    var cards = string.Join("", items.Select(item =>
+    {
+        var (review, existing) = item;
+        var existingLink = existing is null
+            ? "a document that is no longer in the library"
+            : $"<a href='/documents/{existing.Id}'>{H(existing.Title)}</a>{(existing.DocumentDate.HasValue ? $" ({existing.DocumentDate.Value:dd MMM yyyy})" : "")}";
+        var verdict = review.IsIdentical
+            ? $"This file is identical to the scan of {existingLink}."
+            : $"Its text is <strong>{Math.Round(review.Similarity * 100)}%</strong> the same as {existingLink}.";
+        var compare = review.IsIdentical || existing is null || review.OcrText is null ? "" : $"""
+            <details class='compare'><summary>Compare the text</summary><div class='compare-grid'>
+              <div><p class='eyebrow'>NEW SCAN</p><pre class='ocr-text'>{H(Trim(review.OcrText, 2500))}</pre></div>
+              <div><p class='eyebrow'>ALREADY IN LIBRARY</p><pre class='ocr-text'>{H(Trim(existing.OcrText, 2500))}</pre></div>
+            </div></details>
+            """;
+        return $"""
+            <section class='review-card'>
+              <p class='eyebrow'>{(review.IsIdentical ? "IDENTICAL FILE" : "POSSIBLE DUPLICATE")}</p>
+              <h2>{H(review.FileName)}</h2>
+              <p class='review-verdict'>{verdict}</p>
+              <p class='review-links'><a href='/reviews/{review.Id}/file' target='_blank'>Open the new scan</a>{(existing is null ? "" : $"<a href='/files/{existing.Id}' target='_blank'>Open the existing PDF</a>")}</p>
+              {compare}
+              <div class='review-actions'>
+                <form method='post' action='/reviews/{review.Id}/discard'><button class='primary' type='submit'>Discard scan</button></form>
+                <form method='post' action='/reviews/{review.Id}/process'><button class='button' type='submit'>Process anyway</button></form>
+              </div>
+              <p class='hint review-found'>Found {review.DetectedAt.ToLocalTime():dd MMM yyyy HH:mm}</p>
+            </section>
+            """;
+    }));
+    if (items.Count == 0) cards = "<section class='review-empty'><p>No scans are waiting for review.</p><p><a class='button' href='/'>Back to documents</a></p></section>";
+    return $"""
+        <p><a class='back' href='/'>← All documents</a></p>{notice}
+        <div class='edit-heading'><p class='eyebrow'>BEFORE PROCESSING</p><h1>Possible duplicates</h1>
+        <p>These scans look like documents already in your library, so they were not processed. Discarding a scan moves it to <code>{H(duplicatesFolder)}</code>; nothing is deleted.</p></div>
+        <div class='review-list'>{cards}</div>
+        """;
+}
+
+static string DetailPage(DocumentRecord d, string? message, IReadOnlyDictionary<string, string> colours)
 {
     var notice = string.IsNullOrWhiteSpace(message) ? "" : $"<div class='notice'>{H(message)}</div>";
     var metadata = $"<dl><dt>Document date</dt><dd>{H(d.DocumentDate?.ToString("dd MMMM yyyy") ?? "Not detected")}</dd>" +
         $"<dt>From</dt><dd>{H(d.Sender ?? "Not detected")}</dd><dt>Addressed to</dt><dd>{H(d.Addressee ?? "Not detected")}</dd>" +
-        $"<dt>Tags</dt><dd>{string.Join(" ", d.Tags.Select(t => $"<span class='tag'>{H(t)}</span>"))}</dd>" +
+        $"<dt>Category</dt><dd>{(d.Category is null ? "Not set" : CategoryChip(d.Category, colours))}</dd>" +
+        $"<dt>Tags</dt><dd>{string.Join(" ", d.Tags.Select(tag => TagChip(tag, colours)))}</dd>" +
         $"<dt>Keywords</dt><dd>{H(string.Join(", ", d.Keywords))}</dd>" +
+        $"<dt>Scanned</dt><dd>{H(d.ScannedAt?.ToString("dd MMM yyyy HH:mm") ?? "Unknown")}</dd>" +
         $"<dt>Processed</dt><dd>{H(d.ProcessedAt.ToLocalTime().ToString("dd MMM yyyy HH:mm"))}</dd></dl>";
     return $"""
         <p><a class='back' href='/'>← All documents</a></p>{notice}
@@ -505,9 +789,27 @@ static string EditPage(DocumentRecord d, string? message) => $"""
 
 static string ProcessingPage(string currentModel) => """
     <div class='processing'><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Processing scans</h1>
-    <p id='status' aria-live='polite'>Preparing your scan queue…</p><div class='progress' role='progressbar' aria-label='Document processing progress'><div id='bar'></div></div>
-    <p id='counter' class='count'></p><p class='hint'>Keep this page open while documents are being read, tagged and saved.</p>
-    <div id='complete' class='actions hidden'><a class='primary' href='/'>View document library</a></div>
+    <div class='scan-stage'>
+      <div class='doc-anim' id='doc-anim' data-step='idle' aria-hidden='true'>
+        <div class='doc-sheet doc-under'></div>
+        <div class='doc-sheet doc-front'><span class='doc-line'></span><span class='doc-line'></span><span class='doc-line'></span><span class='doc-line'></span><span class='doc-line'></span><span class='doc-line'></span><span class='doc-line'></span><span class='doc-beam'></span></div>
+        <span class='doc-badge' id='doc-badge'></span>
+        <span class='doc-pages hidden' id='doc-pages'></span>
+      </div>
+      <div class='scan-info'>
+        <p class='scan-file' id='scan-file'>Preparing your scan queue…</p>
+        <p class='scan-detail' id='scan-detail' aria-live='polite'></p>
+        <ol class='scan-steps' id='scan-steps' aria-label='Processing steps'>
+          <li data-step='render'>Render</li><li data-step='ocr'>Read text</li><li data-step='check'>Duplicates</li><li data-step='analyse'>Analyse</li><li data-step='save'>Save</li>
+        </ol>
+      </div>
+    </div>
+    <div class='progress' role='progressbar' aria-label='Overall progress' aria-valuemin='0' aria-valuemax='100'><div id='bar'></div></div>
+    <div class='progress-meta'><span id='counter' class='count'></span><span id='percent' class='count'></span></div>
+    <p id='status' class='run-summary hidden' role='status'></p>
+    <ul id='results' class='run-results' aria-label='Files in this run'></ul>
+    <p class='hint' id='leave-hint'>You can leave this page; processing carries on in the background.</p>
+    <div id='complete' class='actions hidden'><a id='review-link' class='primary hidden' href='/reviews'></a><a id='library-link' class='primary' href='/'>View document library</a></div>
     <footer class='model-settings'>
       <p class='eyebrow'>OLLAMA MODEL</p>
       <p>Currently using <strong id='current-model'>__CURRENT_MODEL__</strong></p>
@@ -519,24 +821,102 @@ static string ProcessingPage(string currentModel) => """
       <p id='index-status' class='hint'></p>
     </footer></div>
     <script>
+    // Share of one document's processing time taken by each step, so the bar moves steadily within a document.
+    const steps = ['render', 'ocr', 'check', 'analyse', 'save'];
+    const weights = {render: 0.15, ocr: 0.45, check: 0.05, analyse: 0.30, save: 0.05};
+    const badges = {check: '≈', analyse: '✦', save: '↓', done: '✓'};
+    const resultIcons = {saved: '✓', duplicate: '!', failed: '✕'};
+    let shownResults = 0;
+    function documentFraction(step, fraction) {
+      let done = 0;
+      for (const name of steps) {
+        if (name === step) return done + weights[name] * Math.min(1, Math.max(0, fraction || 0));
+        done += weights[name];
+      }
+      return 0;
+    }
+    function showResults(results) {
+      const list = document.getElementById('results');
+      for (const result of results.slice(shownResults)) {
+        const item = document.createElement('li');
+        item.className = result.outcome;
+        const icon = document.createElement('span');
+        icon.className = 'icon';
+        icon.textContent = resultIcons[result.outcome] || '•';
+        const text = document.createElement('div');
+        const name = document.createElement('strong');
+        name.textContent = result.file;
+        const detail = document.createElement('span');
+        detail.className = 'detail';
+        detail.textContent = result.detail;
+        text.append(name, detail);
+        item.append(icon, text);
+        if (result.documentId || result.outcome === 'duplicate') {
+          const link = document.createElement('a');
+          link.href = result.documentId ? '/documents/' + result.documentId : '/reviews';
+          link.textContent = result.documentId ? 'Open' : 'Review';
+          item.append(link);
+        }
+        list.append(item);
+      }
+      shownResults = results.length;
+    }
+    function showStep(state) {
+      const step = state.running ? (state.step || 'idle') : (shownResults > 0 ? 'done' : 'idle');
+      const animation = document.getElementById('doc-anim');
+      animation.dataset.step = step;
+      animation.classList.toggle('multi', state.pages > 1);
+      document.getElementById('doc-badge').textContent = badges[step] || '';
+      const pages = document.getElementById('doc-pages');
+      const onPages = state.running && (step === 'render' || step === 'ocr') && state.page > 0;
+      pages.textContent = onPages ? (state.pages > 0 ? `Page ${state.page} of ${state.pages}` : `Page ${state.page}`) : '';
+      pages.classList.toggle('hidden', !onPages);
+      const current = steps.indexOf(step);
+      for (const item of document.querySelectorAll('#scan-steps li')) {
+        const index = steps.indexOf(item.dataset.step);
+        item.classList.toggle('done', step === 'done' || (current >= 0 && index < current));
+        item.classList.toggle('active', index === current);
+      }
+    }
     async function refreshProgress() {
       try {
         const state = await fetch('/api/processing', {cache: 'no-store'}).then(r => r.json());
-        document.getElementById('status').textContent = state.message;
         if (state.index) document.getElementById('index-status').textContent = state.index;
+        showResults(state.results || []);
+        showStep(state);
         const total = state.total || 0;
+        const working = state.running && state.file && state.completed < total;
+        document.getElementById('scan-file').textContent = state.running ? (state.file || state.message) : 'Finished';
+        document.getElementById('scan-detail').textContent = state.running ? (working ? state.detail || 'Preparing the document…' : '') : '';
+        const summary = document.getElementById('status');
+        summary.textContent = state.running ? '' : state.message;
+        summary.classList.toggle('hidden', state.running);
         const progress = document.querySelector('.progress');
-        const indeterminate = state.running && (!total || state.completed < total);
-        progress.classList.toggle('indeterminate', indeterminate);
-        const percent = total ? Math.round((state.completed / total) * 100) : (state.running ? 8 : 100);
+        const percent = total ? Math.min(100, ((state.completed + (working ? documentFraction(state.step, state.stepFraction) : 0)) / total) * 100) : (state.running ? 0 : 100);
+        progress.classList.toggle('indeterminate', state.running && !total);
+        progress.setAttribute('aria-valuenow', Math.round(percent));
         const bar = document.getElementById('bar');
-        if (indeterminate) bar.style.removeProperty('width');
-        else bar.style.width = Math.min(100, percent) + '%';
-        document.getElementById('counter').textContent = total ? `${state.completed} of ${total} document${total === 1 ? '' : 's'} handled` : '';
-        if (!state.running) { document.getElementById('complete').classList.remove('hidden'); clearInterval(timer); }
+        if (state.running && !total) bar.style.removeProperty('width');
+        else bar.style.width = Math.max(2, percent) + '%';
+        document.getElementById('counter').textContent = !total ? '' : state.running
+          ? `Document ${Math.min(state.completed + 1, total)} of ${total}`
+          : `${total} document${total === 1 ? '' : 's'} handled`;
+        document.getElementById('percent').textContent = total ? `${Math.floor(percent)}%` : '';
+        document.getElementById('leave-hint').classList.toggle('hidden', !state.running);
+        if (!state.running) {
+          // Duplicates need a decision, so reviewing them becomes the main action and the library link steps back.
+          const reviewLink = document.getElementById('review-link');
+          if (state.reviews > 0) {
+            reviewLink.textContent = state.reviews === 1 ? 'Review 1 possible duplicate' : `Review ${state.reviews} possible duplicates`;
+            reviewLink.classList.remove('hidden');
+            document.getElementById('library-link').className = 'button';
+          }
+          document.getElementById('complete').classList.remove('hidden');
+          clearInterval(timer);
+        }
       } catch { document.getElementById('status').textContent = 'Waiting for the local service…'; }
     }
-    const timer = setInterval(refreshProgress, 800); refreshProgress();
+    const timer = setInterval(refreshProgress, 700); refreshProgress();
     const modelSelect = document.getElementById('model-select');
     const modelSave = document.getElementById('model-save');
     const modelStatus = document.getElementById('model-status');
@@ -626,6 +1006,54 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .chat-answer .cite{color:#9ed0ff;text-decoration:none;font-size:.82em;font-weight:650;white-space:nowrap}.chat-answer .cite:hover{text-decoration:underline}.chat-placeholder{color:var(--muted)}.chat-error{border-color:rgba(255,156,168,.45);color:#ffd2d8}
     .chat-sources{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:.8rem}.chat-sources:empty{display:none}.chat-sources span{color:var(--muted);font-weight:650;letter-spacing:.06em;text-transform:uppercase;font-size:.68rem;margin-right:2px}.chat-sources a{color:#c4e0ff;text-decoration:none;padding:3px 9px;border-radius:99px;background:rgba(79,140,255,.12);border:1px solid rgba(139,190,255,.25)}.chat-sources a:hover{background:rgba(79,140,255,.22)}
     .chat-warning{margin:0;font-size:.8rem;color:#ffd9a0}
+    .review-notice{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:rgba(255,190,90,.1);border-color:rgba(255,200,120,.35);color:#ffe2b8}.review-notice .button{padding:7px 13px}
+    .review-list{display:grid;gap:18px}.review-card{margin:0}.review-card h2{margin:4px 0 8px;overflow-wrap:anywhere}.review-card .eyebrow{color:#ffcf8a}
+    .review-verdict{margin:0 0 10px}.review-verdict a,.review-links a{color:#9ed0ff}.review-links{display:flex;flex-wrap:wrap;gap:8px 18px;margin:0 0 14px;font-size:.9rem}
+    .compare{margin:0 0 16px}.compare>summary{cursor:pointer;color:var(--muted);font-weight:650;font-size:.9rem;margin-bottom:10px}.compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compare-grid .eyebrow{margin-bottom:6px}.compare-grid .ocr-text{max-height:340px;font-size:12px}
+    .review-actions{display:flex;gap:10px;flex-wrap:wrap}.review-actions form{margin:0}.review-found{margin:12px 0 0;font-size:.8rem}.review-empty{text-align:center;color:var(--muted)}
+    .scan-stage{display:grid;grid-template-columns:auto minmax(0,1fr);gap:28px;align-items:center;margin:26px 0 24px}
+    .doc-anim{position:relative;width:96px;height:124px;margin:4px 8px 28px 4px}
+    .doc-sheet{position:absolute;inset:0;border-radius:7px;background:linear-gradient(180deg,#f4f7ff,#dbe4f6);box-shadow:0 14px 34px rgba(0,8,30,.45)}
+    .doc-under{background:linear-gradient(180deg,#c9d5ee,#aebfe0);transform:translate(10px,-8px) rotate(5deg);opacity:0;transition:opacity .3s}.doc-anim.multi .doc-under{opacity:.8}
+    .doc-front{overflow:hidden;padding:20px 13px 0;display:flex;flex-direction:column;gap:8px;clip-path:polygon(0 0,calc(100% - 18px) 0,100% 18px,100% 100%,0 100%)}
+    .doc-front:before{content:'';position:absolute;top:0;right:0;width:18px;height:18px;background:linear-gradient(to bottom left,transparent 50%,#a9b9db 50%)}
+    .doc-line{display:block;height:6px;border-radius:3px;background:#b2c0dc;transform-origin:left center}.doc-line:nth-child(1){width:58%;height:8px;background:#7387b3}.doc-line:nth-child(2){width:92%}.doc-line:nth-child(3){width:80%}.doc-line:nth-child(4){width:96%}.doc-line:nth-child(5){width:70%}.doc-line:nth-child(6){width:88%}.doc-line:nth-child(7){width:44%}
+    .doc-line:nth-child(2){animation-delay:.1s}.doc-line:nth-child(3){animation-delay:.2s}.doc-line:nth-child(4){animation-delay:.3s}.doc-line:nth-child(5){animation-delay:.4s}.doc-line:nth-child(6){animation-delay:.5s}.doc-line:nth-child(7){animation-delay:.6s}
+    .doc-beam{position:absolute;left:0;right:0;top:-24px;height:22px;background:linear-gradient(180deg,transparent,rgba(79,140,255,.6) 60%,rgba(140,190,255,.95) 64%,transparent 70%);opacity:0}
+    .doc-badge{position:absolute;right:-14px;bottom:-12px;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:1rem;color:#fff;background:linear-gradient(135deg,#4f8cff,#4269e8);box-shadow:0 8px 22px rgba(30,80,200,.45);transform:scale(0);transition:transform .25s ease}.doc-badge:not(:empty){transform:scale(1)}
+    .doc-pages{position:absolute;left:50%;bottom:-32px;transform:translateX(-50%);white-space:nowrap;font-size:.74rem;font-weight:700;padding:2px 9px;border-radius:99px;background:rgba(79,140,255,.18);border:1px solid rgba(139,190,255,.32);color:#c4e0ff}
+    .doc-anim[data-step=idle]{animation:doc-float 3s ease-in-out infinite}
+    .doc-anim[data-step=render] .doc-line{animation:doc-line-draw 1.6s ease-in-out infinite}
+    .doc-anim[data-step=ocr] .doc-beam{animation:doc-scan 1.8s linear infinite}.doc-anim[data-step=ocr] .doc-line{background:#a3b6dd}.doc-anim[data-step=ocr] .doc-line:nth-child(1){background:#6a80b0}
+    .doc-anim[data-step=check] .doc-under{opacity:.9;animation:doc-compare 1.1s ease-in-out infinite alternate}
+    .doc-anim[data-step=analyse] .doc-line{background:linear-gradient(90deg,#b2c0dc 0%,#6ea7ff 50%,#b2c0dc 100%);background-size:220% 100%;animation:doc-shimmer 1.5s linear infinite}.doc-anim[data-step=analyse] .doc-badge{animation:doc-pulse 1.4s ease-in-out infinite}
+    .doc-anim[data-step=save] .doc-front{animation:doc-drop .9s ease-in-out infinite alternate}
+    .doc-anim[data-step=done] .doc-badge{background:linear-gradient(135deg,#34c98e,#1f9c6c);box-shadow:0 8px 22px rgba(20,140,90,.45)}
+    @keyframes doc-float{50%{transform:translateY(-5px)}}
+    @keyframes doc-line-draw{0%{transform:scaleX(0)}45%,100%{transform:scaleX(1)}}
+    @keyframes doc-scan{0%{top:-24px;opacity:1}100%{top:124px;opacity:1}}
+    @keyframes doc-compare{to{transform:translate(-16px,-4px) rotate(-6deg)}}
+    @keyframes doc-shimmer{from{background-position:120% 0}to{background-position:-120% 0}}
+    @keyframes doc-pulse{50%{transform:scale(1.15)}}
+    @keyframes doc-drop{to{transform:translateY(6px)}}
+    @keyframes step-pulse{50%{box-shadow:0 0 0 5px rgba(79,140,255,.25)}}
+    .scan-file{font-weight:700;font-size:1.05rem;margin:0;overflow-wrap:anywhere}.scan-detail{color:var(--muted);margin:4px 0 0;min-height:1.55em}
+    .scan-steps{list-style:none;display:flex;flex-wrap:wrap;gap:6px;padding:0;margin:14px 0 0;counter-reset:step}
+    .scan-steps li{counter-increment:step;display:flex;align-items:center;gap:6px;font-size:.76rem;font-weight:650;color:var(--muted);padding:3px 10px 3px 4px;border-radius:99px;border:1px solid rgba(156,190,245,.18);transition:.2s}
+    .scan-steps li:before{content:counter(step);width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:.66rem;background:rgba(156,190,245,.14)}
+    .scan-steps li.active{color:#e3efff;border-color:rgba(139,190,255,.6);background:rgba(79,140,255,.16)}.scan-steps li.active:before{background:#4f8cff;color:#fff;animation:step-pulse 1.4s ease-in-out infinite}
+    .scan-steps li.done{color:#a8dcc4}.scan-steps li.done:before{content:'✓';background:rgba(94,234,160,.2);color:#8ff0c0}
+    .progress-meta{display:flex;justify-content:space-between;gap:12px}.progress-meta .count{margin:0 2px 14px}
+    .run-summary{margin:0 0 12px;font-weight:650}
+    .run-results{list-style:none;padding:0;margin:0 0 6px;display:grid;gap:6px;max-height:280px;overflow:auto}.run-results:empty{display:none}
+    .run-results li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:start;padding:8px 11px;border-radius:10px;background:rgba(6,17,37,.42);border:1px solid rgba(156,190,245,.12);font-size:.86rem}
+    .run-results .icon{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-size:.7rem;font-weight:800;margin-top:1px}
+    .run-results .saved .icon{background:rgba(94,234,160,.2);color:#8ff0c0}.run-results .duplicate .icon{background:rgba(255,190,90,.2);color:#ffcf8a}.run-results .failed .icon{background:rgba(255,120,140,.2);color:#ffb3bf}
+    .run-results strong{display:block;overflow-wrap:anywhere}.run-results .detail{display:block;color:var(--muted);overflow-wrap:anywhere}.run-results a{color:#9ed0ff;text-decoration:none;font-weight:650}.run-results .failed .detail{color:#ffc4cd}
+    @media(prefers-reduced-motion:reduce){.doc-anim,.doc-anim *,.scan-steps li:before,.progress>div{animation:none!important}.doc-anim[data-step=ocr] .doc-beam{opacity:1;top:50%}}
+    @media(max-width:650px){.scan-stage{grid-template-columns:1fr;justify-items:center;text-align:center;gap:10px}.scan-steps{justify-content:center}}
+    code{font:13px ui-monospace,Consolas,monospace;background:rgba(6,17,37,.6);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
+    @media(max-width:650px){.compare-grid{grid-template-columns:1fr}.review-actions{display:grid;grid-template-columns:1fr}.review-actions button{width:100%}.review-notice .button{width:100%;text-align:center}}
     /* Layout for desktop and mobile */
     body{background-attachment:scroll;background-color:#07101f}html{background:#07101f}
     .visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
@@ -677,9 +1105,58 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     /* 16px stops iOS Safari zooming into a field when it is tapped. */
     @media(max-width:800px),(pointer:coarse){:root{--input-size:16px}.ocr-input{font-size:16px}}
     @media(pointer:coarse){.primary,.button,button{min-height:44px}.dialog-close button{min-width:44px}}
+    a.tag{text-decoration:none;font-weight:500;transition:filter .15s}a.tag:hover{filter:brightness(1.25)}
+    .tag.category{font-weight:700}.tag.category:before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor;margin:0 5px 1px 0;vertical-align:middle}
+    .col-tags{min-width:200px}.doc-row td.col-name{box-shadow:inset 3px 0 0 var(--accent,transparent)}
+    .view-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:18px 0 0}
+    .segmented{display:inline-flex;padding:3px;border-radius:11px;background:rgba(6,17,37,.55);border:1px solid rgba(156,190,245,.18)}
+    .segmented a{padding:7px 14px;border-radius:8px;color:var(--muted);text-decoration:none;font-weight:650;font-size:.88rem;white-space:nowrap}
+    .segmented a.active{background:rgba(79,140,255,.25);color:#e3efff;box-shadow:inset 0 0 0 1px rgba(139,190,255,.4)}.segmented a:not(.active):hover{color:var(--text)}
+    .button.disabled{opacity:.4;cursor:default;pointer-events:none}
+    .pager{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:8px;margin:18px 0}.pager-status{color:var(--muted);padding:0 8px}
+    .calendar-bar{display:flex;flex-wrap:wrap;align-items:center;gap:12px 18px;margin:18px 0 0}
+    .cal-nav{display:flex;align-items:center;gap:10px}.cal-nav h2{margin:0;min-width:9.5em;text-align:center;font-size:1.25rem}.cal-nav .button{padding:5px 13px;font-size:1.15rem;line-height:1.3}
+    .cal-jump{display:flex;gap:8px;align-items:center}.cal-jump input{width:auto;padding:7px 10px}.calendar-bar .segmented{margin-left:auto}
+    .calendar{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:rgba(156,190,245,.13);border:1px solid rgba(171,201,250,.2);border-radius:16px;overflow:hidden}
+    .cal-weekday{background:rgba(9,22,47,.88);padding:9px 10px;font-size:.68rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+    .cal-day{background:rgba(11,25,52,.85);min-height:118px;padding:8px;display:flex;flex-direction:column;gap:5px;min-width:0}
+    .cal-day.other-month{background:rgba(6,15,33,.88)}.cal-day.other-month .cal-num,.cal-day.other-month .cal-docs{opacity:.5}
+    .cal-date{display:flex;align-items:baseline;gap:6px}.cal-dow,.cal-mon{display:none}
+    .cal-num{font-size:.85rem;font-weight:700;color:var(--muted);width:26px;height:26px;display:grid;place-items:center;border-radius:50%}.cal-day.today .cal-num{background:#4f8cff;color:#fff}
+    .cal-docs{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr);gap:4px;min-width:0}
+    .cal-doc{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:3px 7px;border-radius:6px;font-size:.78rem;font-weight:600;text-decoration:none;color:var(--accent-text,#dbe5f7);background:var(--accent-soft,rgba(156,190,245,.12));border-left:3px solid var(--accent,rgba(156,190,245,.45))}
+    .cal-doc:hover{filter:brightness(1.25)}.cal-flag{margin-right:4px;opacity:.85}
+    .filter-notice{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.filter-notice a{color:#9ed0ff;font-weight:650}
+    .cal-more-link{font-size:.75rem;color:#9ed0ff;font-weight:650;text-decoration:none;padding:1px 2px}.cal-more-link:hover{text-decoration:underline}
+    .cal-more>summary{cursor:pointer;font-size:.75rem;color:#9ed0ff;font-weight:650;list-style:none;padding:1px 2px}.cal-more>summary::-webkit-details-marker{display:none}.cal-more[open]>summary{margin-bottom:4px}
+    .cal-empty{display:none}
+    @media(max-width:800px){
+      .calendar-bar .segmented{margin-left:0}
+      .calendar{display:block;background:none;border:0;border-radius:0;overflow:visible}
+      .cal-weekday,.cal-day:not(.has-docs),.cal-day.other-month{display:none}
+      .cal-day{display:grid;grid-template-columns:52px minmax(0,1fr);gap:4px 12px;min-height:0;padding:12px 14px;margin-bottom:8px;border-radius:14px;border:1px solid rgba(171,201,250,.18)}
+      .cal-date{flex-direction:column;align-items:center;gap:0;grid-row:span 2}.cal-dow,.cal-mon{display:block;font-size:.64rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.cal-num{font-size:1.15rem;color:var(--text);width:34px;height:34px}
+      .cal-doc{white-space:normal;font-size:.88rem;padding:7px 10px}
+      .cal-empty{display:block;text-align:center;color:var(--muted);padding:28px 0}
+      .doc-row{border-left:4px solid var(--accent,rgba(171,201,250,.2))}.doc-row td.col-name{box-shadow:none}
+    }
+    @media(max-width:650px){.cal-nav{width:100%;justify-content:space-between}.cal-nav h2{min-width:0}.cal-jump{flex:1}.cal-jump input{flex:1}.pager .button{padding:8px 11px}}
+    .label-status{min-height:1.4em;color:#a8dcc4;margin:0 0 4px}
+    .label-list{display:grid}
+    .label-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;padding:10px 2px;border-bottom:1px solid rgba(156,190,245,.1)}.label-row:last-child{border-bottom:0}
+    .label-name{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}.label-count{color:var(--muted);font-size:.8rem;text-decoration:none;white-space:nowrap}.label-count:hover{color:#9ed0ff}
+    .swatches{display:flex;flex-wrap:wrap;gap:5px;border:0;margin:0;padding:0;min-width:0}
+    .swatch{position:relative;display:inline-grid;cursor:pointer}.swatch input{position:absolute;inset:0;margin:0;opacity:0;cursor:pointer}
+    .swatch span{width:22px;height:22px;border-radius:50%;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);transition:transform .12s}
+    .swatch:hover span{transform:scale(1.12)}.swatch input:checked+span{box-shadow:0 0 0 2px #071120,0 0 0 4px #fff}.swatch input:focus-visible+span{outline:2px solid #8bc5ff;outline-offset:4px}
+    .swatch-none span{background:repeating-linear-gradient(45deg,#26324d 0 3px,#4a5a80 3px 6px)}
+    .label-search{display:flex;gap:8px}.label-search input{width:min(260px,52vw)}
+    @media(pointer:coarse){.swatch span{width:28px;height:28px}.swatches{gap:7px}}
+    __PALETTE__
     </style></head><body><main><header class='site-header'><a class='site-mark' href='/'>Document Tagger</a>__ACCOUNT__</header>__BODY__</main></body></html>
     """.Replace("__TITLE__", H(title))
     .Replace("__ACCOUNT__", signedIn ? "<form method='post' action='/sign-out'><button class='button' type='submit'>Sign out</button></form>" : "")
+    .Replace("__PALETTE__", LabelColours.Css)
     .Replace("__BODY__", body);
 
 static string H(string value) => System.Net.WebUtility.HtmlEncode(value);
@@ -807,6 +1284,8 @@ sealed class TaggerSettings
     public string PdfToPpmPath { get; set; } = "pdftoppm";
     public string TesseractPath { get; set; } = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe";
     public int RenderDpi { get; set; } = 300;
+    /// <summary>Folder containing Tesseract's eng.traineddata. Leave empty to find it next to tesseract.exe automatically.</summary>
+    public string TessdataPath { get; set; } = "";
 
     /// <summary>Ollama model used to embed document chunks for semantic search. Leave empty for keyword search only.</summary>
     public string EmbeddingModel { get; set; } = "nomic-embed-text";
@@ -822,6 +1301,8 @@ sealed class TaggerSettings
     public int MaxContextChunks { get; set; } = 8;
     /// <summary>How long Ollama keeps models loaded after a request.</summary>
     public string KeepAlive { get; set; } = "10m";
+    /// <summary>How similar (0–1) a new scan's text must be to an existing document before it is held back as a possible duplicate.</summary>
+    public double DuplicateThreshold { get; set; } = 0.75;
 }
 
 sealed class OllamaModelSelection(TaggerSettings settings)
@@ -854,6 +1335,7 @@ sealed class OllamaModelSelection(TaggerSettings settings)
 sealed class ProcessingStatus
 {
     private readonly object gate = new();
+    private readonly List<ProcessingResult> results = [];
     private ProcessingSnapshot state = new(false, 0, 0, "Nothing is currently being processed.");
 
     public bool TryBegin()
@@ -861,46 +1343,162 @@ sealed class ProcessingStatus
         lock (gate)
         {
             if (state.Running) return false;
+            results.Clear();
             state = new ProcessingSnapshot(true, 0, 0, "Preparing the scan queue…");
             return true;
         }
     }
-    public void Report(ProcessingUpdate update) { lock (gate) state = new ProcessingSnapshot(true, update.Completed, update.Total, update.Message); }
-    public void Complete(string message) { lock (gate) state = state with { Running = false, Message = message }; }
-    public void Fail(string message) { lock (gate) state = state with { Running = false, Message = message }; }
-    public ProcessingSnapshot Snapshot() { lock (gate) return state; }
+    public void Report(ProcessingUpdate update)
+    {
+        lock (gate)
+            state = new ProcessingSnapshot(true, update.Completed, update.Total, update.Message, update.File, update.Scan?.Step, update.Scan?.Message,
+                update.Scan?.Page ?? 0, update.Scan?.Pages ?? 0, update.Scan?.Fraction ?? 0);
+    }
+    public void AddResult(ProcessingResult result) { lock (gate) results.Add(result); }
+    public void Complete(string message) { lock (gate) state = state with { Running = false, Message = message, File = null, Step = null, Detail = null }; }
+    public void Fail(string message) { lock (gate) state = state with { Running = false, Message = message, File = null, Step = null, Detail = null }; }
+    public ProcessingSnapshot Snapshot() { lock (gate) return state with { Results = results.ToList() }; }
 }
 
 sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient ollama, DocumentIndexer indexer, TaggerSettings settings)
 {
-    public async Task<string> ProcessPendingAsync(Action<ProcessingUpdate>? progress = null)
+    public const string DuplicatesFolderName = "Duplicates";
+
+    private sealed record ScanWork(string Path, ScanReview? ApprovedReview);
+
+    public async Task<string> ProcessPendingAsync(Action<ProcessingUpdate>? progress = null, Action<ProcessingResult>? onResult = null)
     {
         progress?.Invoke(new ProcessingUpdate(0, 0, "Looking for PDFs in the scans folder…"));
         if (!Directory.Exists(settings.ScansDirectory)) return $"Scans folder was not found: {settings.ScansDirectory}";
-        var files = Directory.EnumerateFiles(settings.ScansDirectory, "*.pdf", SearchOption.TopDirectoryOnly).ToList();
-        var pending = files.Where(path => !store.HasSource(path)).ToList();
-        if (pending.Count == 0) return "No new PDFs found in the scans folder.";
-        var completed = 0; var errors = new List<string>(); var total = pending.Count;
-        progress?.Invoke(new ProcessingUpdate(completed, total, $"Found {total} new PDF{(total == 1 ? "" : "s")}."));
-        foreach (var file in pending)
+
+        var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var completed = 0; var total = 0; var saved = 0; var flagged = 0; var errors = new List<string>();
+        // Repeat while new work appears, so a scan approved with "Process anyway" during this run is picked up before it ends.
+        for (var round = 0; round < 20; round++)
         {
-            var name = Path.GetFileName(file);
-            progress?.Invoke(new ProcessingUpdate(completed, total, $"Processing {name}: preparing document…"));
-            try
+            var work = FindWork(handled);
+            if (work.Count == 0) break;
+            total += work.Count;
+            progress?.Invoke(new ProcessingUpdate(completed, total, round == 0 ? $"Found {total} new PDF{(total == 1 ? "" : "s")}." : $"Added {work.Count} approved scan{(work.Count == 1 ? "" : "s")}."));
+            foreach (var item in work)
             {
-                await ProcessFileAsync(file, null, stage => progress?.Invoke(new ProcessingUpdate(completed, total, $"Processing {name}: {stage}")));
-                completed++;
-                progress?.Invoke(new ProcessingUpdate(completed, total, $"Saved {name}."));
-            }
-            catch (Exception ex)
-            {
-                completed++;
-                errors.Add($"{name}: {ex.Message}");
-                progress?.Invoke(new ProcessingUpdate(completed, total, $"Could not process {name}: {ex.Message}"));
+                handled.Add(item.Path);
+                var name = Path.GetFileName(item.Path);
+                progress?.Invoke(new ProcessingUpdate(completed, total, $"Processing {name}: preparing document…", name));
+                try
+                {
+                    var documentId = await ProcessScanAsync(item, scan => progress?.Invoke(new ProcessingUpdate(completed, total, $"Processing {name}: {scan.Message}", name, scan)));
+                    completed++;
+                    if (documentId is null)
+                    {
+                        flagged++;
+                        onResult?.Invoke(new ProcessingResult(name, "duplicate", "Looks like a document you already have. Waiting for your review."));
+                    }
+                    else
+                    {
+                        saved++;
+                        onResult?.Invoke(new ProcessingResult(name, "saved", "Saved and indexed.", documentId));
+                    }
+                    progress?.Invoke(new ProcessingUpdate(completed, total, documentId is null ? $"{name} looks like a duplicate and is waiting for your review." : $"Saved {name}."));
+                }
+                catch (Exception ex)
+                {
+                    completed++;
+                    errors.Add($"{name}: {ex.Message}");
+                    onResult?.Invoke(new ProcessingResult(name, "failed", ex.Message));
+                    progress?.Invoke(new ProcessingUpdate(completed, total, $"Could not process {name}: {ex.Message}"));
+                }
             }
         }
-        return errors.Count == 0 ? $"Processed {completed} document(s)." : $"Processed {completed}; {errors.Count} failed. {string.Join(" ", errors)}";
+
+        var waiting = store.CountReviews(ScanReview.Pending);
+        if (total == 0)
+            return waiting == 0 ? "No new PDFs found in the scans folder." : $"No new PDFs found. {Plural(waiting, "possible duplicate")} {(waiting == 1 ? "is" : "are")} waiting for your review.";
+        var message = $"Processed {Plural(saved, "document")}.";
+        if (flagged > 0) message += $" {Plural(flagged, "scan")} looked like {(flagged == 1 ? "a duplicate" : "duplicates")} and {(flagged == 1 ? "needs" : "need")} your review.";
+        if (errors.Count > 0) message += $" {errors.Count} failed. {string.Join(" ", errors)}";
+        return message;
     }
+
+    /// <summary>New scans in the folder, plus scans the user approved after a duplicate warning. Scans waiting for review are skipped.</summary>
+    private List<ScanWork> FindWork(HashSet<string> handled)
+    {
+        var reviews = new Dictionary<string, ScanReview>(StringComparer.OrdinalIgnoreCase);
+        foreach (var review in store.GetReviews())
+        {
+            // Forget reviews whose scan was removed or moved outside the app.
+            if (File.Exists(review.SourcePath)) reviews[review.SourcePath] = review;
+            else store.DeleteReview(review.Id);
+        }
+
+        var work = new List<ScanWork>();
+        foreach (var file in Directory.EnumerateFiles(settings.ScansDirectory, "*.pdf", SearchOption.TopDirectoryOnly))
+        {
+            if (handled.Contains(file) || store.IsProcessedSource(file)) continue;
+            if (reviews.TryGetValue(file, out var review))
+            {
+                // A file replaced under the same name is a different scan, so it is checked again from scratch.
+                if (!string.Equals(review.ContentHash, DocumentStore.ComputeContentHash(file), StringComparison.Ordinal)) store.DeleteReview(review.Id);
+                else if (review.Status == ScanReview.Approved) { work.Add(new ScanWork(file, review)); continue; }
+                else continue;
+            }
+            work.Add(new ScanWork(file, null));
+        }
+        return work;
+    }
+
+    /// <summary>Processes one scan and returns the new document's id, or holds the scan for review and returns null when it looks like a document already in the library.</summary>
+    private async Task<long?> ProcessScanAsync(ScanWork item, Action<ScanProgress> progress)
+    {
+        var hash = DocumentStore.ComputeContentHash(item.Path);
+        if (item.ApprovedReview is null && store.FindDocumentByContentHash(hash) is long identicalTo)
+        {
+            progress(new ScanProgress(ScanSteps.Check, "this file is identical to a document you already have.", Fraction: 1));
+            store.SaveReview(new ScanReview(0, item.Path, hash, null, identicalTo, 1, ScanReview.IdenticalReason, DateTimeOffset.UtcNow, ScanReview.Pending));
+            return null;
+        }
+
+        // An approved rescan keeps the OCR text from when it was flagged, so it is not read twice.
+        var text = item.ApprovedReview?.OcrText ?? await ocr.ReadPdfAsync(item.Path, progress);
+        if (string.IsNullOrWhiteSpace(text)) throw new InvalidOperationException("OCR returned no readable text.");
+        if (item.ApprovedReview is null)
+        {
+            progress(new ScanProgress(ScanSteps.Check, "checking for duplicates…", Fraction: 0.5));
+            if (DuplicateDetector.FindBestMatch(text, store.GetDuplicateCandidates(), settings.DuplicateThreshold) is { } match)
+            {
+                store.SaveReview(new ScanReview(0, item.Path, hash, text, match.DocumentId, match.Similarity, ScanReview.SimilarReason, DateTimeOffset.UtcNow, ScanReview.Pending));
+                return null;
+            }
+        }
+
+        var id = await ProcessFileAsync(item.Path, null, progress, text);
+        if (item.ApprovedReview is not null) store.DeleteReview(item.ApprovedReview.Id);
+        return id;
+    }
+
+    /// <summary>Moves a duplicate scan out of the scans folder into its Duplicates subfolder, where it is never picked up again.</summary>
+    public string DiscardDuplicate(long reviewId)
+    {
+        var review = store.GetReview(reviewId);
+        if (review is null) return "That scan is no longer waiting for review.";
+        var folder = Path.Combine(settings.ScansDirectory, DuplicatesFolderName);
+        try
+        {
+            if (File.Exists(review.SourcePath))
+            {
+                Directory.CreateDirectory(folder);
+                File.Move(review.SourcePath, AvailablePath(folder, review.FileName, null));
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return $"Could not move {review.FileName}: {ex.Message}";
+        }
+        store.DeleteReview(review.Id);
+        return $"Discarded {review.FileName}. It was moved to {folder}.";
+    }
+
+    private static string Plural(int count, string noun) => $"{count} {noun}{(count == 1 ? "" : "s")}";
 
     public async Task<string> ReprocessAsync(long id)
     {
@@ -910,22 +1508,25 @@ sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient
         catch (Exception ex) { return $"Reprocessing failed: {ex.Message}"; }
     }
 
-    private async Task ProcessFileAsync(string sourcePath, long? existingId, Action<string>? stage)
+    private async Task<long> ProcessFileAsync(string sourcePath, long? existingId, Action<ScanProgress>? progress, string? ocrText = null)
     {
-        var text = await ocr.ReadPdfAsync(sourcePath, stage);
+        var text = ocrText ?? await ocr.ReadPdfAsync(sourcePath, progress);
         if (string.IsNullOrWhiteSpace(text)) throw new InvalidOperationException("OCR returned no readable text.");
         var fileName = Path.GetFileName(sourcePath);
-        stage?.Invoke($"Ollama is starting metadata analysis for {fileName}…");
+        // Ollama gives no progress until it writes, so the step creeps forward with elapsed time and never reaches the end on its own.
+        var elapsed = Stopwatch.StartNew();
+        double AnalysisFraction() => 0.95 * (1 - Math.Exp(-elapsed.Elapsed.TotalSeconds / 45));
+        string Elapsed() => elapsed.Elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
+        progress?.Invoke(new ScanProgress(ScanSteps.Analyse, "Ollama is reading the text to find the title, date, sender and tags…"));
         var analysisTask = ollama.AnalyseAsync(text, fileName, count =>
-            stage?.Invoke($"Received {count:N0} characters of metadata from Ollama for {fileName}…"));
-        if (stage is not null)
+            progress?.Invoke(new ScanProgress(ScanSteps.Analyse, $"Ollama is writing the metadata ({count:N0} characters, {Elapsed()} elapsed)…", Fraction: AnalysisFraction())));
+        if (progress is not null)
         {
-            var elapsed = Stopwatch.StartNew();
-            while (await Task.WhenAny(analysisTask, Task.Delay(TimeSpan.FromSeconds(5))) != analysisTask)
-                stage($"Ollama is still analysing {fileName} ({elapsed.Elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture)} elapsed)…");
+            while (await Task.WhenAny(analysisTask, Task.Delay(TimeSpan.FromSeconds(2))) != analysisTask)
+                progress(new ScanProgress(ScanSteps.Analyse, $"Ollama is analysing the document ({Elapsed()} elapsed)…", Fraction: AnalysisFraction()));
         }
         var analysis = await analysisTask;
-        stage?.Invoke("saving tagged PDF and metadata…");
+        progress?.Invoke(new ScanProgress(ScanSteps.Save, "saving the tagged PDF and metadata…", Fraction: 0.2));
         var title = string.IsNullOrWhiteSpace(analysis.Title) ? Path.GetFileNameWithoutExtension(sourcePath) : analysis.Title;
         var category = DocumentCategories.Normalize(analysis.Category);
         var date = analysis.DocumentDate ?? DateOnly.FromDateTime(File.GetCreationTime(sourcePath));
@@ -945,8 +1546,9 @@ sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient
         var record = new DocumentRecord(existingId ?? 0, sourcePath, Path.GetFileName(sourcePath), destination, title, analysis.DocumentDate, analysis.Sender, analysis.Addressee, tags, analysis.Keywords ?? new(), analysis.Summary ?? "", text, DateTimeOffset.UtcNow, category);
         var id = store.Upsert(record);
         DocumentMetadataWriter.Write(record with { Id = id });
-        stage?.Invoke("indexing for search…");
+        progress?.Invoke(new ScanProgress(ScanSteps.Save, "indexing the text for search…", Fraction: 0.6));
         await indexer.IndexAsync(record with { Id = id });
+        return id;
     }
 
     private static string AvailablePath(string directory, string fileName, string? current) { var path = Path.Combine(directory, fileName); var n = 2; while (File.Exists(path) && !string.Equals(path, current, StringComparison.OrdinalIgnoreCase)) path = Path.Combine(directory, $"{Path.GetFileNameWithoutExtension(fileName)} ({n++}).pdf"); return path; }
@@ -955,47 +1557,162 @@ sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient
 
 sealed class OcrService(TaggerSettings settings)
 {
-    public async Task<string> ReadPdfAsync(string pdfPath, Action<string>? stage = null)
+    public async Task<string> ReadPdfAsync(string pdfPath, Action<ScanProgress>? progress = null)
     {
         var scratch = Path.Combine(Path.GetTempPath(), "document-tagger", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(scratch);
         try
         {
             var prefix = Path.Combine(scratch, "page");
-            stage?.Invoke("rendering PDF pages…");
-            await RunAsync(settings.PdfToPpmPath, $"-r {settings.RenderDpi} -png {Q(pdfPath)} {Q(prefix)}", scratch, "PDF rendering");
+            var expected = await GetPageCountAsync(pdfPath);
+            progress?.Invoke(new ScanProgress(ScanSteps.Render, expected > 0 ? $"rendering {expected} page{(expected == 1 ? "" : "s")}…" : "rendering PDF pages…", 0, expected));
+            // pdftoppm renders every page in one run, so progress comes from watching the page images appear.
+            var seen = 0;
+            await RunAsync(ToolPath(settings.PdfToPpmPath, "pdftoppm"), $"-r {settings.RenderDpi} -png {Q(pdfPath)} {Q(prefix)}", scratch, "PDF rendering", () =>
+            {
+                var rendered = Directory.EnumerateFiles(scratch, "page-*.png").Count();
+                if (rendered == seen) return;
+                seen = rendered;
+                var total = Math.Max(expected, rendered);
+                progress?.Invoke(new ScanProgress(ScanSteps.Render, expected > 0 ? $"rendering page {rendered} of {total}…" : $"rendering page {rendered}…", rendered, expected, expected > 0 ? (rendered - 1) / (double)total : 0));
+            });
             var pages = Directory.EnumerateFiles(scratch, "page-*.png").OrderBy(x => x).ToList();
             if (pages.Count == 0) throw new InvalidOperationException("No PDF pages were rendered.");
             var output = new StringBuilder();
-            foreach (var page in pages)
+            var tesseract = ToolPath(settings.TesseractPath, "tesseract");
+            var tessdata = FindTessdata(tesseract);
+            var languageData = tessdata is null ? "" : $" --tessdata-dir {Q(tessdata)}";
+            for (var i = 0; i < pages.Count; i++)
             {
-                var baseName = Path.Combine(scratch, Path.GetFileNameWithoutExtension(page));
-                stage?.Invoke($"reading page {pages.IndexOf(page) + 1} of {pages.Count} with OCR…");
-                await RunAsync(settings.TesseractPath, $"{Q(page)} {Q(baseName)} -l eng", scratch, "Tesseract OCR");
+                var baseName = Path.Combine(scratch, Path.GetFileNameWithoutExtension(pages[i]));
+                progress?.Invoke(new ScanProgress(ScanSteps.Ocr, $"reading page {i + 1} of {pages.Count} with OCR…", i + 1, pages.Count, i / (double)pages.Count));
+                try
+                {
+                    await RunAsync(tesseract, $"{Q(pages[i])} {Q(baseName)}{languageData} -l eng", scratch, "Tesseract OCR");
+                }
+                catch (InvalidOperationException ex) when (ex.Message.Contains("traineddata", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("load any languages", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(tessdata is null
+                        ? "Tesseract could not find its English language data (eng.traineddata). Set TessdataPath in appsettings.json to the folder that contains it, usually a 'tessdata' folder in the Tesseract installation."
+                        : $"Tesseract could not load eng.traineddata from {tessdata}. Download it from https://github.com/tesseract-ocr/tessdata into that folder, or set TessdataPath in appsettings.json.");
+                }
                 var result = baseName + ".txt"; if (File.Exists(result)) output.AppendLine(await File.ReadAllTextAsync(result));
             }
             return output.ToString().Trim();
         }
         finally { try { Directory.Delete(scratch, true); } catch { } }
     }
-    private static async Task RunAsync(string program, string arguments, string workingDirectory, string step)
+
+    /// <summary>The PDF's page count from poppler's pdfinfo (installed next to pdftoppm), or 0 when it cannot be read.</summary>
+    private async Task<int> GetPageCountAsync(string pdfPath)
+    {
+        var pdftoppm = ToolPath(settings.PdfToPpmPath, "pdftoppm");
+        var folder = Path.GetDirectoryName(pdftoppm);
+        var pdfinfo = string.IsNullOrEmpty(folder) ? "pdfinfo" : Path.Combine(folder, "pdfinfo" + Path.GetExtension(pdftoppm));
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo(pdfinfo, Q(pdfPath)) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true });
+            if (process is null) return 0;
+            var output = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await process.WaitForExitAsync(timeout.Token);
+            var pages = Regex.Match(await output, @"^Pages:\s+(\d+)", RegexOptions.Multiline);
+            return pages.Success ? int.Parse(pages.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or OperationCanceledException) { return 0; }
+    }
+
+    /// <summary>
+    /// The folder holding Tesseract's language data, passed as --tessdata-dir. Builds that are unzipped rather than installed
+    /// (for example a source build with the data in ..\share\tessdata) do not find it on their own, and the app runs Tesseract
+    /// from a temporary folder, so it is searched for next to tesseract.exe. Null leaves Tesseract to its own default.
+    /// </summary>
+    private string? FindTessdata(string tesseract)
+    {
+        if (!string.IsNullOrWhiteSpace(settings.TessdataPath)) return Path.TrimEndingDirectorySeparator(settings.TessdataPath);
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TESSDATA_PREFIX"))) return null;
+        var folder = Path.GetDirectoryName(tesseract);
+        if (string.IsNullOrEmpty(folder)) return null;
+        return new[] { Path.Combine(folder, "tessdata"), Path.Combine(folder, "..", "share", "tessdata"), Path.Combine(folder, "..", "tessdata") }
+            .Select(Path.GetFullPath)
+            .FirstOrDefault(candidate => File.Exists(Path.Combine(candidate, "eng.traineddata")));
+    }
+
+    /// <summary>Accepts either the executable or the folder that contains it.</summary>
+    private static string ToolPath(string configured, string executable) =>
+        Directory.Exists(configured) ? Path.Combine(configured, executable + ".exe") : configured;
+
+    private static async Task RunAsync(string program, string arguments, string workingDirectory, string step, Action? whileRunning = null)
     {
         try
         {
-            using var process = Process.Start(new ProcessStartInfo(program, arguments) { WorkingDirectory = workingDirectory, RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false }) ?? throw new InvalidOperationException($"Could not start {program}.");
-            var error = await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync();
-            if (process.ExitCode != 0) throw new InvalidOperationException($"{step} failed. {error.Trim()}");
+            using var process = Process.Start(new ProcessStartInfo(program, arguments) { WorkingDirectory = workingDirectory, RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true }) ?? throw new InvalidOperationException($"Could not start {program}.");
+            // Both streams are drained while the tool runs; a full, unread pipe would make it hang.
+            var error = process.StandardError.ReadToEndAsync();
+            _ = process.StandardOutput.ReadToEndAsync();
+            var exited = process.WaitForExitAsync();
+            while (await Task.WhenAny(exited, Task.Delay(250)) != exited) whileRunning?.Invoke();
+            whileRunning?.Invoke();
+            if (process.ExitCode != 0) throw new InvalidOperationException($"{step} failed. {(await error).Trim()}");
         }
         catch (System.ComponentModel.Win32Exception) { throw new InvalidOperationException($"{step} requires '{program}'. Install it or set its full path in appsettings.json."); }
     }
     private static string Q(string value) => $"\"{value.Replace("\"", "\\\"")}\"";
 }
 
-record DocumentRecord(long Id, string SourcePath, string OriginalFileName, string FilePath, string Title, DateOnly? DocumentDate, string? Sender, string? Addressee, List<string> Tags, List<string> Keywords, string Summary, string OcrText, DateTimeOffset ProcessedAt, string? Category = null);
+record DocumentRecord(long Id, string SourcePath, string OriginalFileName, string FilePath, string Title, DateOnly? DocumentDate, string? Sender, string? Addressee, List<string> Tags, List<string> Keywords, string Summary, string OcrText, DateTimeOffset ProcessedAt, string? Category = null, DateTime? ScannedAt = null);
 sealed record ChatRequest(string? Question, long? DocumentId, List<ChatTurn>? History);
 record DocumentAnalysis(string? Title, DateOnly? DocumentDate, string? Sender, string? Addressee, string? Category, List<string>? Tags, List<string>? Keywords, string? Summary);
-record ProcessingUpdate(int Completed, int Total, string Message);
-record ProcessingSnapshot(bool Running, int Completed, int Total, string Message);
-record DocumentQuery(string? Name = null, string? Content = null, string? Tag = null, string? From = null, string? To = null, string? Message = null) { public static DocumentQuery Parse(IQueryCollection q) => new(q["name"].ToString(), q["content"].ToString(), q["tag"].ToString(), q["from"].ToString(), q["to"].ToString(), q["message"].ToString()); }
+static class ScanSteps
+{
+    public const string Render = "render";
+    public const string Ocr = "ocr";
+    public const string Check = "check";
+    public const string Analyse = "analyse";
+    public const string Save = "save";
+}
+
+/// <summary>Where one scan is in processing. <see cref="Fraction"/> is how far through the current step it is (0–1).</summary>
+record ScanProgress(string Step, string Message, int Page = 0, int Pages = 0, double Fraction = 0);
+record ProcessingUpdate(int Completed, int Total, string Message, string? File = null, ScanProgress? Scan = null);
+/// <summary>The outcome for one file in a run: <c>saved</c>, <c>duplicate</c> or <c>failed</c>.</summary>
+record ProcessingResult(string File, string Outcome, string Detail, long? DocumentId = null);
+record ProcessingSnapshot(bool Running, int Completed, int Total, string Message, string? File = null, string? Step = null, string? Detail = null, int Page = 0, int Pages = 0, double StepFraction = 0, IReadOnlyList<ProcessingResult>? Results = null);
+/// <summary>
+/// The home page's state, all held in the URL so any view can be bookmarked or shared: filters, list or calendar view,
+/// the list page, and the calendar month and whether it places documents by document date or scan date.
+/// </summary>
+record DocumentQuery(string? Name = null, string? Content = null, string? Tag = null, string? From = null, string? To = null, string? Message = null,
+    string View = "list", int Page = 1, string? Month = null, string By = "document", string? Scanned = null)
+{
+    public bool IsCalendar => View == "calendar";
+    public bool ByScanDate => By == "scanned";
+    public bool HasFilters => new[] { Name, Content, Tag, From, To, Scanned }.Any(value => !string.IsNullOrWhiteSpace(value));
+    /// <summary>A "scanned on this day" filter, set by the calendar's link to a busy day's documents.</summary>
+    public DateOnly? ScannedOn => DateOnly.TryParseExact(Scanned, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : null;
+
+    /// <summary>The first day of the requested month, from a <c>yyyy-MM</c> value.</summary>
+    public DateOnly? MonthStart => DateOnly.TryParseExact(Month + "-01", "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var month) ? month : null;
+
+    public static DocumentQuery Parse(IQueryCollection q) => new(
+        q["name"].ToString(), q["content"].ToString(), q["tag"].ToString(), q["from"].ToString(), q["to"].ToString(), q["message"].ToString(),
+        q["view"].ToString() == "calendar" ? "calendar" : "list",
+        int.TryParse(q["page"].ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out var page) && page > 0 ? page : 1,
+        q["month"].ToString() is { Length: > 0 } month ? month : null,
+        q["by"].ToString() == "scanned" ? "scanned" : "document",
+        q["scanned"].ToString() is { Length: > 0 } scanned ? scanned : null);
+
+    /// <summary>A home page link with this state; one-off values (the message) are dropped, and defaults are left out to keep URLs short.</summary>
+    public string Url()
+    {
+        var parts = new List<string>();
+        void Add(string key, string? value) { if (!string.IsNullOrWhiteSpace(value)) parts.Add($"{key}={Uri.EscapeDataString(value)}"); }
+        Add("name", Name); Add("content", Content); Add("tag", Tag); Add("from", From); Add("to", To); Add("scanned", Scanned);
+        if (IsCalendar) { Add("view", View); Add("month", Month); if (ByScanDate) Add("by", By); }
+        else if (Page > 1) Add("page", Page.ToString(CultureInfo.InvariantCulture));
+        return parts.Count == 0 ? "/" : "/?" + string.Join("&", parts);
+    }
+}
 
 /// <summary>Lists the installed Ollama models and the model currently selected by the application.</summary>
 sealed record OllamaModelsResponse(string CurrentModel, IReadOnlyList<string> Models);

@@ -60,6 +60,7 @@ The settings live in `appsettings.json` under the `DocumentTagger` section:
     "ChunkOverlap": 200,
     "MaxContextChunks": 8,
     "KeepAlive": "10m",
+    "DuplicateThreshold": 0.75,
     "PdfToPpmPath": "C:\\path\\to\\Poppler\\Library\\bin\\pdftoppm.exe",
     "TesseractPath": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
     "RenderDpi": 300
@@ -73,7 +74,8 @@ Common settings:
 - `ProcessedDirectory`: where processed PDFs are saved
 - `DatabaseDirectory`: folder for the SQLite database (`documents.db`)
 - `OllamaUrl` and `OllamaModel`: local Ollama endpoint and initial model; the processing page can select any installed model, saved in `DatabaseDirectory\ollama-model.txt` and used for future app requests
-- `PdfToPpmPath` and `TesseractPath`: full paths to the render and OCR executables (the Windows service cannot rely on your interactive PATH)
+- `PdfToPpmPath` and `TesseractPath`: full paths to the render and OCR executables, or the folders that contain them (the Windows service cannot rely on your interactive PATH). Poppler's `pdfinfo`, installed next to `pdftoppm`, is used to show "page X of Y" while processing
+- `TessdataPath`: the folder containing Tesseract's `eng.traineddata`. Usually leave it empty: the app looks for `tessdata` next to `tesseract.exe`, including the `..\share\tessdata` layout of an unzipped source build. Set it if OCR fails with "Error opening data file eng.traineddata"
 - `RenderDpi`: OCR rendering resolution
 - `EmbeddingModel`: Ollama model for semantic search; leave empty for keyword search only. Changing it re-embeds every document in the background
 - `ChatContextTokens` and `AnalysisContextTokens`: the Ollama context window (`num_ctx`) for chat and for metadata extraction. Prompts are sized to fit, so nothing is silently cut. Keep the two equal, or Ollama reloads the model when it switches between them
@@ -81,6 +83,7 @@ Common settings:
 - `ChunkSize`, `ChunkOverlap`: size of the OCR passages in the search index, in characters
 - `MaxContextChunks`: the most passages sent to the model for one archive question
 - `KeepAlive`: how long Ollama keeps models loaded between requests
+- `DuplicateThreshold`: how similar (0 to 1) a new scan's text must be to an existing document before it is held back as a possible duplicate. Raise it if different documents are flagged; lower it if rescans slip through
 
 ## How the chat finds answers
 
@@ -126,6 +129,20 @@ To apply app or dependency path changes to an existing service, run the installe
 
 From the home page, click **Process scans** to process every new PDF in the scans folder. The original file is left untouched.
 
+The processing page shows the file being worked on, its current step (render, read text, check for duplicates, analyse, save), and which page is being rendered or read. It also lists the result for each file. Processing continues in the background if you leave the page.
+
+### Duplicate scans
+
+Before a scan is sent to Ollama, it is checked against the library:
+
+- **Identical file**: a byte-for-byte copy of a scan that was already processed.
+- **Possible duplicate**: a new scan whose OCR text closely matches an existing document, such as the same letter scanned twice. Both the wording and the numbers have to match, so next month's bill from the same company is not flagged.
+
+A flagged scan is not processed. The home page and the processing page link to **Possible duplicates**, where you can open both PDFs, compare their text, and choose:
+
+- **Discard scan**: moves the file to a `Duplicates` folder inside the scans folder. Nothing is deleted, and files there are never picked up again.
+- **Process anyway**: processes it as a new document, reusing the OCR text that was already read.
+
 Processed documents are saved under:
 
 ```text
@@ -142,17 +159,28 @@ Files are renamed with a date prefix, for example:
 
 If the same date and title occur multiple times, the app adds a numeric suffix.
 
-## Search and metadata editing
+## Browsing, search and metadata editing
+
+The home page has two views, and the filters apply to both:
+
+- **List**: newest first, 50 documents per page. Each row's left edge shows the document's colour.
+- **Calendar**: a month grid with each document under its document date. Switch to **Scan date** to place documents by when they were scanned instead. A document with no document date appears on its scan date, marked ◷. On a phone the calendar becomes a list of the days that have documents. Days with many documents link to the list for that day.
+
+The scan date is the scan file's last-modified time, which is when the scanner wrote it. Documents processed before this was recorded use the original scan file's time if it still exists, otherwise the time they were processed.
 
 The web UI can search by:
 
 - title
 - sender or addressee
-- tags
+- tag or category (with suggestions as you type; clicking any tag or category chip also filters by it)
 - document date
 - keywords
 - summary text
 - OCR text
+
+### Colours
+
+The **Colours** page assigns a colour to any category or tag. Categories start with defaults, such as Bills amber, Legal red, Medical green and Tax violet. You can change them or switch them off. Tags have no colour until you choose one. A document takes the colour of its first coloured tag, otherwise its category's colour. The colour appears on its chips, its row in the list and its calendar entry.
 
 Each processed document can be opened for:
 

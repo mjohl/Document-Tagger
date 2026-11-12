@@ -17,6 +17,12 @@ readonly record struct ChunkVector(long ChunkId, long DocumentId, float[] Vector
 /// <summary>Document metadata without the OCR text, for filtering and catalogues.</summary>
 sealed record DocumentSummary(long Id, string Title, DateOnly? DocumentDate, string? Sender, string? Addressee, string? Category, List<string> Tags, string Summary);
 
+/// <summary>A document as the home page list and calendar show it: no OCR text, and a shortened summary.</summary>
+sealed record DocumentListItem(long Id, string Title, string OriginalFileName, DateOnly? DocumentDate, string? Sender, string? Addressee, string? Category, List<string> Tags, string Summary, DateTime? ScannedAt)
+{
+    public DateOnly? ScannedDate => ScannedAt is { } scanned ? DateOnly.FromDateTime(scanned) : null;
+}
+
 sealed record DocumentFilter(DateOnly? From = null, DateOnly? To = null, string? Sender = null, string? Addressee = null, string? Category = null)
 {
     public bool IsEmpty => From is null && To is null && Sender is null && Addressee is null && Category is null;
@@ -42,8 +48,11 @@ sealed class DocumentStore(TaggerSettings settings)
         Execute(db, """CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL UNIQUE, content_hash TEXT NULL, original_file_name TEXT NOT NULL, file_path TEXT NOT NULL, title TEXT NOT NULL, document_date TEXT NULL, sender TEXT NULL, addressee TEXT NULL, tags_json TEXT NOT NULL, keywords_json TEXT NOT NULL, summary TEXT NOT NULL, ocr_text TEXT NOT NULL, processed_at TEXT NOT NULL);""");
         EnsureColumn(db, "content_hash", "TEXT NULL");
         EnsureColumn(db, "category", "TEXT NULL");
+        EnsureColumn(db, "scanned_at", "TEXT NULL");
         BackfillContentHashes(db);
         BackfillCategories(db);
+        BackfillScannedAt(db);
+        Execute(db, "CREATE TABLE IF NOT EXISTS label_colours (label TEXT NOT NULL PRIMARY KEY COLLATE NOCASE, colour TEXT NOT NULL);");
 
         // The old documents_fts table was recreated empty on every start and never queried. Chunks replace it.
         Execute(db, """
@@ -52,18 +61,128 @@ sealed class DocumentStore(TaggerSettings settings)
             CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, text TEXT NOT NULL, embedding BLOB NULL, embedding_model TEXT NULL);
             CREATE INDEX IF NOT EXISTS ix_chunks_document ON chunks(document_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, document_id UNINDEXED, tokenize='porter unicode61 remove_diacritics 2');
+            CREATE TABLE IF NOT EXISTS scan_reviews (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL UNIQUE, content_hash TEXT NOT NULL, ocr_text TEXT NULL, duplicate_of INTEGER NOT NULL, similarity REAL NOT NULL, reason TEXT NOT NULL, detected_at TEXT NOT NULL, status TEXT NOT NULL);
             """);
     }
 
-    public bool HasSource(string sourcePath)
+    /// <summary>True when a document has already been created from this exact scan file.</summary>
+    public bool IsProcessedSource(string sourcePath)
     {
-        var contentHash = ComputeContentHash(sourcePath);
         using var db = Open();
         using var command = db.CreateCommand();
-        command.CommandText = "SELECT EXISTS(SELECT 1 FROM documents WHERE source_path=$source OR content_hash=$hash)";
+        command.CommandText = "SELECT EXISTS(SELECT 1 FROM documents WHERE source_path=$source)";
         command.Parameters.AddWithValue("$source", sourcePath);
+        return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture) == 1;
+    }
+
+    /// <summary>The document whose scan is byte-for-byte identical to a file with this hash, if any.</summary>
+    public long? FindDocumentByContentHash(string contentHash)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT id FROM documents WHERE content_hash=$hash ORDER BY id LIMIT 1";
         command.Parameters.AddWithValue("$hash", contentHash);
-        return Convert.ToInt32(command.ExecuteScalar()) == 1;
+        return command.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>Every document's OCR text, for comparing a new scan against the library.</summary>
+    public IReadOnlyList<(long Id, string Text)> GetDuplicateCandidates()
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT id, ocr_text FROM documents";
+        using var reader = command.ExecuteReader();
+        var candidates = new List<(long, string)>();
+        while (reader.Read()) candidates.Add((reader.GetInt64(0), reader.GetString(1)));
+        return candidates;
+    }
+
+    public void SaveReview(ScanReview review)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = """
+            INSERT INTO scan_reviews(source_path, content_hash, ocr_text, duplicate_of, similarity, reason, detected_at, status)
+            VALUES($source, $hash, $ocr, $duplicateOf, $similarity, $reason, $detected, $status)
+            ON CONFLICT(source_path) DO UPDATE SET content_hash=excluded.content_hash, ocr_text=excluded.ocr_text, duplicate_of=excluded.duplicate_of,
+              similarity=excluded.similarity, reason=excluded.reason, detected_at=excluded.detected_at, status=excluded.status;
+            """;
+        command.Parameters.AddWithValue("$source", review.SourcePath);
+        command.Parameters.AddWithValue("$hash", review.ContentHash);
+        command.Parameters.AddWithValue("$ocr", (object?)review.OcrText ?? DBNull.Value);
+        command.Parameters.AddWithValue("$duplicateOf", review.DuplicateOfId);
+        command.Parameters.AddWithValue("$similarity", review.Similarity);
+        command.Parameters.AddWithValue("$reason", review.Reason);
+        command.Parameters.AddWithValue("$detected", review.DetectedAt.ToString("O"));
+        command.Parameters.AddWithValue("$status", review.Status);
+        command.ExecuteNonQuery();
+    }
+
+    public IReadOnlyList<ScanReview> GetReviews(string? status = null)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT id, source_path, content_hash, ocr_text, duplicate_of, similarity, reason, detected_at, status FROM scan_reviews"
+            + (status is null ? "" : " WHERE status=$status") + " ORDER BY detected_at, id";
+        if (status is not null) command.Parameters.AddWithValue("$status", status);
+        return ReadReviews(command);
+    }
+
+    public ScanReview? GetReview(long id)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT id, source_path, content_hash, ocr_text, duplicate_of, similarity, reason, detected_at, status FROM scan_reviews WHERE id=$id";
+        command.Parameters.AddWithValue("$id", id);
+        return ReadReviews(command).FirstOrDefault();
+    }
+
+    public int CountReviews(string status)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM scan_reviews WHERE status=$status";
+        command.Parameters.AddWithValue("$status", status);
+        return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+    }
+
+    public void SetReviewStatus(long id, string status)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "UPDATE scan_reviews SET status=$status WHERE id=$id";
+        command.Parameters.AddWithValue("$status", status);
+        command.Parameters.AddWithValue("$id", id);
+        command.ExecuteNonQuery();
+    }
+
+    public void DeleteReview(long id)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "DELETE FROM scan_reviews WHERE id=$id";
+        command.Parameters.AddWithValue("$id", id);
+        command.ExecuteNonQuery();
+    }
+
+    private static List<ScanReview> ReadReviews(SqliteCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var reviews = new List<ScanReview>();
+        while (reader.Read())
+        {
+            reviews.Add(new ScanReview(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetInt64(4),
+                reader.GetDouble(5),
+                reader.GetString(6),
+                DateTimeOffset.Parse(reader.GetString(7), CultureInfo.InvariantCulture),
+                reader.GetString(8)));
+        }
+        return reviews;
     }
 
     public long Upsert(DocumentRecord r)
@@ -71,12 +190,12 @@ sealed class DocumentStore(TaggerSettings settings)
         using var db = Open();
         if (r.Id == 0)
         {
-            using var insert = Command(db, "INSERT INTO documents(source_path,content_hash,original_file_name,file_path,title,document_date,sender,addressee,tags_json,keywords_json,summary,ocr_text,processed_at,category) VALUES($source,$hash,$original,$file,$title,$date,$sender,$addressee,$tags,$keywords,$summary,$ocr,$processed,$category); SELECT last_insert_rowid();", r);
+            using var insert = Command(db, "INSERT INTO documents(source_path,content_hash,original_file_name,file_path,title,document_date,sender,addressee,tags_json,keywords_json,summary,ocr_text,processed_at,category,scanned_at) VALUES($source,$hash,$original,$file,$title,$date,$sender,$addressee,$tags,$keywords,$summary,$ocr,$processed,$category,$scanned); SELECT last_insert_rowid();", r);
             return (long)(insert.ExecuteScalar() ?? 0L);
         }
 
         // COALESCE keeps the stored hash when the original scan has since been moved or deleted.
-        using var update = Command(db, "UPDATE documents SET source_path=$source,content_hash=COALESCE($hash,content_hash),original_file_name=$original,file_path=$file,title=$title,document_date=$date,sender=$sender,addressee=$addressee,tags_json=$tags,keywords_json=$keywords,summary=$summary,ocr_text=$ocr,processed_at=$processed,category=$category WHERE id=$id;", r);
+        using var update = Command(db, "UPDATE documents SET source_path=$source,content_hash=COALESCE($hash,content_hash),original_file_name=$original,file_path=$file,title=$title,document_date=$date,sender=$sender,addressee=$addressee,tags_json=$tags,keywords_json=$keywords,summary=$summary,ocr_text=$ocr,processed_at=$processed,category=$category,scanned_at=COALESCE(scanned_at,$scanned) WHERE id=$id;", r);
         update.Parameters.AddWithValue("$id", r.Id);
         update.ExecuteNonQuery();
         return r.Id;
@@ -92,18 +211,143 @@ sealed class DocumentStore(TaggerSettings settings)
         return reader.Read() ? Read(reader) : null;
     }
 
-    public IReadOnlyList<string> GetTags() => Search(new DocumentQuery()).SelectMany(x => x.Tags).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
+    // The list and calendar never load OCR text: at a few thousand documents that is tens of megabytes per page view.
+    private const string ListColumns = "id, title, original_file_name, document_date, sender, addressee, category, tags_json, substr(summary, 1, 220) AS summary, scanned_at";
 
-    public IReadOnlyList<DocumentRecord> Search(DocumentQuery q)
+    /// <summary>One page of documents matching the home page filters, newest first, and how many match in total.</summary>
+    public (IReadOnlyList<DocumentListItem> Items, int Total) ListDocuments(DocumentQuery query, int page, int pageSize)
     {
-        using var db = Open(); using var command = db.CreateCommand(); var where = new List<string>();
-        if (!string.IsNullOrWhiteSpace(q.Name)) { where.Add("(title LIKE $name OR sender LIKE $name OR addressee LIKE $name)"); command.Parameters.AddWithValue("$name", $"%{q.Name}%"); }
-        if (!string.IsNullOrWhiteSpace(q.Content)) { where.Add("(ocr_text LIKE $content OR keywords_json LIKE $content OR summary LIKE $content)"); command.Parameters.AddWithValue("$content", $"%{q.Content}%"); }
-        if (!string.IsNullOrWhiteSpace(q.Tag)) { where.Add("tags_json LIKE $tag"); command.Parameters.AddWithValue("$tag", $"%{q.Tag}%"); }
+        using var db = Open();
+        using var command = db.CreateCommand();
+        var where = Filters(query, command);
+        command.CommandText = $"SELECT COUNT(*) FROM documents{where}";
+        var total = Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+        command.CommandText = $"SELECT {ListColumns} FROM documents{where} ORDER BY COALESCE(document_date, date(scanned_at), processed_at) DESC, id DESC LIMIT $limit OFFSET $offset";
+        command.Parameters.AddWithValue("$limit", pageSize);
+        command.Parameters.AddWithValue("$offset", (long)Math.Max(0, page - 1) * pageSize);
+        return (ReadListItems(command), total);
+    }
+
+    /// <summary>
+    /// Documents matching the filters that fall between two dates, for the calendar. By document date, a document without one
+    /// falls back to its scan date (and is marked as such); by scan date, every document uses its scan date.
+    /// </summary>
+    public IReadOnlyList<DocumentListItem> ListDocumentsBetween(DocumentQuery query, DateOnly from, DateOnly to, bool byScanDate)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        var where = Filters(query, command);
+        var day = CalendarDay(byScanDate);
+        command.CommandText = $"SELECT {ListColumns} FROM documents{where}{(where.Length == 0 ? " WHERE " : " AND ")}{day} BETWEEN $start AND $end ORDER BY {day}, title COLLATE NOCASE";
+        command.Parameters.AddWithValue("$start", from.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$end", to.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        return ReadListItems(command);
+    }
+
+    /// <summary>The latest date any matching document appears on in the calendar, used to open on a month that has documents.</summary>
+    public DateOnly? GetLatestCalendarDate(DocumentQuery query, bool byScanDate)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        var where = Filters(query, command);
+        command.CommandText = $"SELECT MAX({CalendarDay(byScanDate)}) FROM documents{where}";
+        return command.ExecuteScalar() is string latest && DateOnly.TryParse(latest, CultureInfo.InvariantCulture, out var date) ? date : null;
+    }
+
+    /// <summary>Tags with how many documents use them, most used first, optionally only those containing some text.</summary>
+    public IReadOnlyList<(string Label, int Count)> GetTagCounts(string? containing, int limit, int minimumUses = 1)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = """
+            SELECT tag.value, COUNT(*) AS uses FROM documents, json_each(documents.tags_json) AS tag
+            WHERE $containing IS NULL OR tag.value LIKE $containing ESCAPE '\'
+            GROUP BY tag.value COLLATE NOCASE HAVING uses >= $minimum
+            ORDER BY uses DESC, tag.value COLLATE NOCASE LIMIT $limit
+            """;
+        command.Parameters.AddWithValue("$containing", string.IsNullOrWhiteSpace(containing) ? DBNull.Value : Like(containing.Trim()));
+        command.Parameters.AddWithValue("$minimum", minimumUses);
+        command.Parameters.AddWithValue("$limit", limit);
+        return ReadCounts(command);
+    }
+
+    public IReadOnlyList<(string Label, int Count)> GetCategoryCounts()
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT category, COUNT(*) FROM documents WHERE category IS NOT NULL GROUP BY category COLLATE NOCASE ORDER BY category COLLATE NOCASE";
+        return ReadCounts(command);
+    }
+
+    /// <summary>The colours chosen on the Colours page, by label. <see cref="LabelColours.None"/> means a default was switched off.</summary>
+    public IReadOnlyDictionary<string, string> GetChosenColours()
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "SELECT label, colour FROM label_colours";
+        using var reader = command.ExecuteReader();
+        var colours = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.Read()) colours[reader.GetString(0)] = reader.GetString(1);
+        return colours;
+    }
+
+    public void SetColour(string label, string colour)
+    {
+        using var db = Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "INSERT INTO label_colours(label, colour) VALUES($label, $colour) ON CONFLICT(label) DO UPDATE SET colour=excluded.colour";
+        command.Parameters.AddWithValue("$label", label);
+        command.Parameters.AddWithValue("$colour", colour);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>The home page filters as a WHERE clause; the tag filter also matches a category, so "Bills" finds bills.</summary>
+    private static string Filters(DocumentQuery q, SqliteCommand command)
+    {
+        var where = new List<string>();
+        if (!string.IsNullOrWhiteSpace(q.Name)) { where.Add("(title LIKE $name ESCAPE '\\' OR sender LIKE $name ESCAPE '\\' OR addressee LIKE $name ESCAPE '\\')"); command.Parameters.AddWithValue("$name", Like(q.Name.Trim())); }
+        if (!string.IsNullOrWhiteSpace(q.Content)) { where.Add("(ocr_text LIKE $content ESCAPE '\\' OR keywords_json LIKE $content ESCAPE '\\' OR summary LIKE $content ESCAPE '\\')"); command.Parameters.AddWithValue("$content", Like(q.Content.Trim())); }
+        if (!string.IsNullOrWhiteSpace(q.Tag))
+        {
+            where.Add("(tags_json LIKE $tag ESCAPE '\\' OR category = $category COLLATE NOCASE)");
+            command.Parameters.AddWithValue("$tag", Like(q.Tag.Trim()));
+            command.Parameters.AddWithValue("$category", q.Tag.Trim());
+        }
         if (!string.IsNullOrWhiteSpace(q.From)) { where.Add("document_date >= $from"); command.Parameters.AddWithValue("$from", q.From); }
         if (!string.IsNullOrWhiteSpace(q.To)) { where.Add("document_date <= $to"); command.Parameters.AddWithValue("$to", q.To); }
-        command.CommandText = "SELECT * FROM documents" + (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + " ORDER BY COALESCE(document_date, processed_at) DESC, id DESC";
-        using var reader = command.ExecuteReader(); var records = new List<DocumentRecord>(); while (reader.Read()) records.Add(Read(reader)); return records;
+        if (q.ScannedOn is { } scanned) { where.Add("date(scanned_at) = $scanned"); command.Parameters.AddWithValue("$scanned", scanned.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)); }
+        return where.Count == 0 ? "" : " WHERE " + string.Join(" AND ", where);
+    }
+
+    private static string CalendarDay(bool byScanDate) => byScanDate ? "date(scanned_at)" : "COALESCE(document_date, date(scanned_at))";
+
+    private static List<DocumentListItem> ReadListItems(SqliteCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var items = new List<DocumentListItem>();
+        while (reader.Read())
+        {
+            items.Add(new DocumentListItem(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.IsDBNull(3) ? null : DateOnly.Parse(reader.GetString(3), CultureInfo.InvariantCulture),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                JsonSerializer.Deserialize<List<string>>(reader.GetString(7)) ?? [],
+                reader.GetString(8),
+                reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture)));
+        }
+        return items;
+    }
+
+    private static List<(string, int)> ReadCounts(SqliteCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var counts = new List<(string, int)>();
+        while (reader.Read()) counts.Add((reader.GetString(0), reader.GetInt32(1)));
+        return counts;
     }
 
     public int CountDocuments()
@@ -322,6 +566,38 @@ sealed class DocumentStore(TaggerSettings settings)
         Execute(db, $"ALTER TABLE documents ADD COLUMN {column} {definition};");
     }
 
+    /// <summary>
+    /// The scan date is the scan file's last-write time: the scanner writes it when the page is scanned, and copying keeps it.
+    /// Stored as local time without an offset so SQLite's date() gives the local calendar day.
+    /// </summary>
+    private static DateTime? ScanTime(string path) => File.Exists(path) ? File.GetLastWriteTime(path) : null;
+    private static string ScanTimestamp(DateTime time) => time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+
+    private static void BackfillScannedAt(SqliteConnection db)
+    {
+        var updates = new List<(long Id, string ScannedAt)>();
+        using (var select = db.CreateCommand())
+        {
+            select.CommandText = "SELECT id, source_path, file_path, processed_at FROM documents WHERE scanned_at IS NULL;";
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                // Without the original scan, the processed copy's timestamp is the next best; failing that, when it was processed.
+                var time = ScanTime(reader.GetString(1)) ?? ScanTime(reader.GetString(2))
+                    ?? DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture).LocalDateTime;
+                updates.Add((reader.GetInt64(0), ScanTimestamp(time)));
+            }
+        }
+        foreach (var (id, scannedAt) in updates)
+        {
+            using var command = db.CreateCommand();
+            command.CommandText = "UPDATE documents SET scanned_at=$scanned WHERE id=$id;";
+            command.Parameters.AddWithValue("$scanned", scannedAt);
+            command.Parameters.AddWithValue("$id", id);
+            command.ExecuteNonQuery();
+        }
+    }
+
     private void BackfillCategories(SqliteConnection db)
     {
         var updates = new List<(long Id, string Category)>();
@@ -379,7 +655,7 @@ sealed class DocumentStore(TaggerSettings settings)
         }
     }
 
-    private static string ComputeContentHash(string path)
+    public static string ComputeContentHash(string path)
     {
         using var stream = File.OpenRead(path);
         return Convert.ToHexString(SHA256.HashData(stream));
@@ -413,6 +689,7 @@ sealed class DocumentStore(TaggerSettings settings)
         c.Parameters.AddWithValue("$ocr", r.OcrText);
         c.Parameters.AddWithValue("$processed", r.ProcessedAt.ToString("O"));
         c.Parameters.AddWithValue("$category", (object?)r.Category ?? DBNull.Value);
+        c.Parameters.AddWithValue("$scanned", ScanTimestamp(r.ScannedAt ?? ScanTime(r.SourcePath) ?? DateTime.Now));
         return c;
     }
 
@@ -430,5 +707,6 @@ sealed class DocumentStore(TaggerSettings settings)
         r.GetString(r.GetOrdinal("summary")),
         r.GetString(r.GetOrdinal("ocr_text")),
         DateTimeOffset.Parse(r.GetString(r.GetOrdinal("processed_at")), CultureInfo.InvariantCulture),
-        r.IsDBNull(r.GetOrdinal("category")) ? null : r.GetString(r.GetOrdinal("category")));
+        r.IsDBNull(r.GetOrdinal("category")) ? null : r.GetString(r.GetOrdinal("category")),
+        r.IsDBNull(r.GetOrdinal("scanned_at")) ? null : DateTime.Parse(r.GetString(r.GetOrdinal("scanned_at")), CultureInfo.InvariantCulture));
 }
