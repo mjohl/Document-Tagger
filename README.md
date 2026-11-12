@@ -12,6 +12,7 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 - Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
 - Copies documents into a date- and category-based folder structure
 - Provides a browser UI for searching, reviewing, editing, and reprocessing documents
+- Requires the Castle account to sign in before using the site
 
 ## Prerequisites
 
@@ -38,7 +39,7 @@ The settings live in `appsettings.json` under the `DocumentTagger` section:
     "DatabaseDirectory": "App_Data",
     "OllamaUrl": "http://localhost:11434",
     "OllamaModel": "llama3.1:8b",
-    "PdfToPpmPath": "pdftoppm",
+    "PdfToPpmPath": "C:\\path\\to\\Poppler\\Library\\bin\\pdftoppm.exe",
     "TesseractPath": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
     "RenderDpi": 300
   }
@@ -51,7 +52,7 @@ Common settings:
 - `ProcessedDirectory`: where processed PDFs are saved
 - `DatabaseDirectory`: folder for the SQLite database (`documents.db`)
 - `OllamaUrl` and `OllamaModel`: local Ollama endpoint and model name
-- `PdfToPpmPath` and `TesseractPath`: paths to the render and OCR engines
+- `PdfToPpmPath` and `TesseractPath`: full paths to the render and OCR executables (the Windows service cannot rely on your interactive PATH)
 - `RenderDpi`: OCR rendering resolution
 
 ## Run
@@ -60,7 +61,27 @@ Common settings:
 dotnet run
 ```
 
-Then open the local URL shown in the terminal, typically on `http://localhost:5000`.
+Then open `http://localhost:5248`.
+Sign in with the Castle account to access the document library. The sign-in session expires after eight hours.
+
+## Run as a Windows service
+
+The app binds only to `http://localhost:5248`, suitable as the origin for a local Cloudflare Tunnel. Configure the tunnel hostname `castledocs.crazyl0v3.icu` to forward to `http://localhost:5248`. The app honors the tunnel's forwarded HTTPS scheme so authentication cookies are Secure for public HTTPS requests while local HTTP development remains usable.
+
+Open an elevated PowerShell window in the repository and run:
+
+```powershell
+.\install-service.ps1
+```
+
+The installer publishes the app under `%LOCALAPPDATA%\DocumentTagger\Service`, preserves the existing SQLite database on first install, prompts for the current Windows account password, and registers an automatic-start Windows service. Running as the same account lets the app access that account's scans folders and local Ollama service. To check or stop the service:
+
+```powershell
+Get-Service DocumentTagger
+Stop-Service DocumentTagger
+```
+
+To apply app or dependency path changes to an existing service, run the installer again from an elevated PowerShell window. It stops the service during publishing, preserves its service account and database, and starts it with the updated configuration.
 
 ## Workflow
 
