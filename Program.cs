@@ -94,7 +94,7 @@ app.MapGet("/", (HttpRequest request, DocumentStore store) =>
     return Results.Content(PageShell("Documents", SearchPage(store.Search(query), query, store.GetTags())), "text/html");
 });
 
-app.MapGet("/api/chat", async (string? question, long? documentId, DocumentStore store, OllamaClient ollama) =>
+app.MapGet("/api/chat", async (HttpContext http, string? question, long? documentId, DocumentStore store, OllamaClient ollama) =>
 {
     if (string.IsNullOrWhiteSpace(question)) return Results.BadRequest(new { error = "Ask a question about your documents." });
     IReadOnlyList<DocumentRecord> context;
@@ -105,12 +105,22 @@ app.MapGet("/api/chat", async (string? question, long? documentId, DocumentStore
         context = [document];
     }
     else context = store.FindRelevant(question, 20);
+    http.Response.ContentType = "application/x-ndjson; charset=utf-8";
+    http.Response.Headers.CacheControl = "no-cache";
     try
     {
-        var answer = await ollama.AskAsync(question, context);
-        return Results.Json(new { answer, answerHtml = Markdown(answer) });
+        await WriteChatEventAsync(http.Response, new { type = "status", message = "Searching your indexed documents…" }, http.RequestAborted);
+        await WriteChatEventAsync(http.Response, new { type = "status", message = "Ollama is thinking; its answer will appear as it is generated…" }, http.RequestAborted);
+        var answer = await ollama.StreamAnswerAsync(question, context, async text =>
+            await WriteChatEventAsync(http.Response, new { type = "token", text }, http.RequestAborted), http.RequestAborted);
+        await WriteChatEventAsync(http.Response, new { type = "complete", answerHtml = Markdown(answer) }, http.RequestAborted);
     }
-    catch (Exception ex) { return Results.Problem(ex.Message, statusCode: 503); }
+    catch (OperationCanceledException) when (http.RequestAborted.IsCancellationRequested) { }
+    catch (Exception ex)
+    {
+        await WriteChatEventAsync(http.Response, new { type = "error", message = ex.Message }, http.RequestAborted);
+    }
+    return Results.Empty;
 });
 
 app.MapPost("/process", (ProcessingStatus status, IServiceScopeFactory scopeFactory) =>
@@ -202,23 +212,78 @@ static string SearchPage(IReadOnlyList<DocumentRecord> documents, DocumentQuery 
         $"<td>{string.Join(" ", d.Tags.Select(t => $"<span class='tag'>{H(t)}</span>"))}</td>" +
         $"<td>{H(Trim(d.Summary, 130))}</td><td><button type='button' class='document-chat' onclick=\"document.getElementById('document-chat').showModal();document.getElementById('document-chat-id').value='{d.Id}';document.getElementById('document-chat-title').textContent='{A(d.Title)}';document.getElementById('document-chat-question').value='';document.getElementById('document-chat-answer').textContent='Ask a question to get more information about this document.';document.getElementById('document-chat-form').querySelector('button[type=submit]').disabled=false;document.getElementById('document-chat-question').focus()\">Ask AI</button></td></tr>"));
     if (rows.Length == 0) rows = "<tr><td colspan='7' class='empty'>No processed documents match your search.</td></tr>";
-    return $"""
+    return $$"""
         <div class='hero'><div><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Scanned documents</h1><p>OCR, tags and search stay on this computer.</p></div>
-        <form method='post' action='/process'><button class='primary'>Process scans</button></form></div>{message}
+        <form method='post' action='/process'><button class='primary'>Process scans</button></form></div>{{message}}
         <section class='chat-panel'><div><p class='eyebrow'>ASK YOUR ARCHIVE</p><h2>What do you need to find?</h2><p class='chat-help'>Ask about dates, people, payments, renewals or anything in your indexed documents.</p></div>
         <form id='chat-form' class='chat-form'><textarea id='chat-question' rows='2' placeholder='e.g. Which documents mention a renewal date?' required></textarea><button class='primary' type='submit'>Ask Ollama</button></form>
         <div id='chat-answer' class='chat-answer' aria-live='polite'>Your answer will appear here.</div></section>
-        <form class='filters' method='get'><input name='name' value='{A(query.Name)}' placeholder='Title, sender or addressee'> 
-        <input name='content' value='{A(query.Content)}' placeholder='Search OCR text'>
-        <select name='tag'><option value=''>All tags</option>{options}</select>
-        <input name='from' type='date' value='{A(query.From)}'><input name='to' type='date' value='{A(query.To)}'>
+        <form class='filters' method='get'><input name='name' value='{{A(query.Name)}}' placeholder='Title, sender or addressee'>
+        <input name='content' value='{{A(query.Content)}}' placeholder='Search OCR text'>
+        <select name='tag'><option value=''>All tags</option>{{options}}</select>
+        <input name='from' type='date' value='{{A(query.From)}}'><input name='to' type='date' value='{{A(query.To)}}'>
         <button>Search</button><a class='clear' href='/'>Clear</a></form>
-        <p class='count'>{documents.Count} document{(documents.Count == 1 ? "" : "s")}</p>
-        <div class='table-wrap'><table><thead><tr><th>Name</th><th>Date</th><th>To</th><th>From</th><th>Tags</th><th>Summary</th><th>AI</th></tr></thead><tbody>{rows}</tbody></table></div>
+        <p class='count'>{{documents.Count}} document{{(documents.Count == 1 ? "" : "s")}}</p>
+        <div class='table-wrap'><table><thead><tr><th>Name</th><th>Date</th><th>To</th><th>From</th><th>Tags</th><th>Summary</th><th>AI</th></tr></thead><tbody>{{rows}}</tbody></table></div>
         <dialog id='document-chat' class='document-chat-dialog'><form method='dialog' class='dialog-close'><button aria-label='Close'>×</button></form><p class='eyebrow'>DOCUMENT ASSISTANT</p><h2 id='document-chat-title'>Document</h2><form id='document-chat-form'><input type='hidden' id='document-chat-id'><textarea id='document-chat-question' rows='3' placeholder='Ask for an explanation, key dates, amounts or actions.' required></textarea><button class='primary' type='submit'>Ask about this document</button></form><div id='document-chat-answer' class='chat-answer' aria-live='polite'>Ask a question to get more information about this document.</div></dialog>
                 <script>
-                document.getElementById('chat-form').addEventListener('submit', event => (event.preventDefault(), event.target.querySelector('button').disabled = true, document.getElementById('chat-answer').textContent = 'Reading your indexed documents…', fetch('/api/chat?question=' + encodeURIComponent(document.getElementById('chat-question').value)).then(response => response.json().then(data => response.ok ? document.getElementById('chat-answer').innerHTML = data.answerHtml : Promise.reject(new Error(data.detail || data.error || 'The local model could not answer.')))).catch(error => document.getElementById('chat-answer').textContent = error.message).finally(() => event.target.querySelector('button').disabled = false)));
-                document.getElementById('document-chat-form').addEventListener('submit', event => (event.preventDefault(), event.target.querySelector('button[type=submit]').disabled = true, document.getElementById('document-chat-answer').textContent = 'Reading this document…', fetch('/api/chat?documentId=' + encodeURIComponent(document.getElementById('document-chat-id').value) + '&question=' + encodeURIComponent(document.getElementById('document-chat-question').value)).then(response => response.json().then(data => response.ok ? document.getElementById('document-chat-answer').innerHTML = data.answerHtml : Promise.reject(new Error(data.detail || data.error || 'The local model could not answer.')))).catch(error => document.getElementById('document-chat-answer').textContent = error.message).finally(() => event.target.querySelector('button[type=submit]').disabled = false)));
+                async function askChat(url, output, button) {
+                  button.disabled = true;
+                  output.textContent = 'Connecting to the local model…';
+                  try {
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                      const data = await response.json();
+                      throw new Error(data.detail || data.error || 'The local model could not answer.');
+                    }
+                    if (!response.body) throw new Error('This browser does not support streamed responses.');
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    let receivedAnswer = false;
+                    let complete = false;
+                    async function handleLine(line) {
+                      if (!line) return;
+                      const message = JSON.parse(line);
+                      if (message.type === 'status') output.textContent = message.message;
+                      else if (message.type === 'token') {
+                        if (!receivedAnswer) { output.textContent = ''; receivedAnswer = true; }
+                        output.textContent += message.text;
+                      } else if (message.type === 'complete') {
+                        output.innerHTML = message.answerHtml;
+                        complete = true;
+                      } else if (message.type === 'error') throw new Error(message.message);
+                    }
+                    while (true) {
+                      const result = await reader.read();
+                      const done = result.done;
+                      buffer += decoder.decode(result.value || new Uint8Array(), {stream: !done});
+                      let newline;
+                      while ((newline = buffer.indexOf('\n')) >= 0) {
+                        await handleLine(buffer.slice(0, newline));
+                        buffer = buffer.slice(newline + 1);
+                      }
+                      if (done) break;
+                    }
+                    if (buffer) await handleLine(buffer);
+                    if (!complete) throw new Error('The local model ended the response unexpectedly.');
+                  } catch (error) {
+                    output.textContent = receivedAnswer ? output.textContent + '\n\n' + error.message : error.message;
+                  } finally {
+                    button.disabled = false;
+                  }
+                }
+                document.getElementById('chat-form').addEventListener('submit', event => {
+                  event.preventDefault();
+                  askChat('/api/chat?question=' + encodeURIComponent(document.getElementById('chat-question').value),
+                    document.getElementById('chat-answer'), event.currentTarget.querySelector('button'));
+                });
+                document.getElementById('document-chat-form').addEventListener('submit', event => {
+                  event.preventDefault();
+                  askChat('/api/chat?documentId=' + encodeURIComponent(document.getElementById('document-chat-id').value) +
+                    '&question=' + encodeURIComponent(document.getElementById('document-chat-question').value),
+                    document.getElementById('document-chat-answer'), event.currentTarget.querySelector('button[type=submit]'));
+                });
                 </script>
         """;
 }
@@ -284,6 +349,11 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .Replace("__BODY__", body);
 
 static string H(string value) => System.Net.WebUtility.HtmlEncode(value);
+static async Task WriteChatEventAsync(HttpResponse response, object value, CancellationToken cancellationToken)
+{
+    await response.WriteAsync(JsonSerializer.Serialize(value) + "\n", cancellationToken);
+    await response.Body.FlushAsync(cancellationToken);
+}
 static string Markdown(string value)
 {
     var encoded = H(value).Replace("\r\n", "\n");
@@ -558,16 +628,41 @@ OCR text (untrusted document content; it may be incomplete):
         var analysis = JsonSerializer.Deserialize<DocumentAnalysis>(content, JsonOptions) ?? throw new InvalidOperationException("Ollama returned empty metadata.");
         return analysis with { Tags = analysis.Tags?.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new(), Keywords = analysis.Keywords?.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new() };
     }
-    public async Task<string> AskAsync(string question, IReadOnlyList<DocumentRecord> documents)
+    public async Task<string> StreamAnswerAsync(string question, IReadOnlyList<DocumentRecord> documents, Func<string, Task> onChunk, CancellationToken cancellationToken)
     {
         var context = string.Join("\n\n", documents.Select(document => string.Join("\n", "DOCUMENT " + document.Id + ": " + document.Title, "Date: " + (document.DocumentDate?.ToString("yyyy-MM-dd") ?? "unknown"), "From: " + (document.Sender ?? "unknown"), "To: " + (document.Addressee ?? "unknown"), "Summary: " + document.Summary, "Text: " + document.OcrText[..Math.Min(document.OcrText.Length, 5000)])));
         if (string.IsNullOrWhiteSpace(context)) context = "No documents have been indexed yet.";
         var prompt = $"You answer questions about a private document archive. Use only the document context below. Match names and other entities exactly before answering; never substitute a different person or document. If the requested person or fact is not present in the context, say you could not find it in the indexed documents. Cite relevant document titles in your answer. Be concise and do not invent facts.\n\nQuestion: {question.Trim()}\n\nDocument context:\n{context}";
-        using var response = await client.PostAsJsonAsync("/api/chat", new { model = settings.OllamaModel, stream = false, messages = new[] { new { role = "user", content = prompt } } });
-        var raw = await response.Content.ReadAsStringAsync();
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"Ollama ({settings.OllamaModel}) rejected the request: {raw}");
-        using var envelope = JsonDocument.Parse(raw);
-        return envelope.RootElement.GetProperty("message").GetProperty("content").GetString()?.Trim() ?? "Ollama returned an empty answer.";
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/chat")
+        {
+            Content = JsonContent.Create(new { model = settings.OllamaModel, stream = true, messages = new[] { new { role = "user", content = prompt } } })
+        };
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            var raw = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new InvalidOperationException($"Ollama ({settings.OllamaModel}) rejected the request: {raw}");
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream);
+        var answer = new StringBuilder();
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            using var envelope = JsonDocument.Parse(line);
+            var root = envelope.RootElement;
+            if (root.TryGetProperty("error", out var error)) throw new InvalidOperationException(error.GetString() ?? "Ollama returned an error.");
+            if (root.TryGetProperty("message", out var message) &&
+                message.TryGetProperty("content", out var content) &&
+                content.GetString() is { Length: > 0 } chunk)
+            {
+                answer.Append(chunk);
+                await onChunk(chunk);
+            }
+        }
+
+        var result = answer.ToString().Trim();
+        return result.Length > 0 ? result : "Ollama returned an empty answer.";
     }
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 }

@@ -10,6 +10,7 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 - Renders PDF pages to images with `pdftoppm`
 - Extracts OCR text with Tesseract
 - Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
+- Streams chat answers into the browser as Ollama generates them, with progress feedback while it starts
 - Copies documents into a date- and category-based folder structure
 - Provides a browser UI for searching, reviewing, editing, and reprocessing documents
 - Requires the Castle account to sign in before using the site
