@@ -458,6 +458,33 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .progress.indeterminate>div{width:35%;animation:progress-slide 1.4s ease-in-out infinite}@keyframes progress-slide{from{transform:translateX(-110%)}to{transform:translateX(310%)}}
     .model-settings{border-top:1px solid var(--line);margin-top:30px;padding-top:20px}.model-settings>p:not(.eyebrow){margin:8px 0}.model-picker{display:grid;gap:7px;margin-top:18px}.model-picker label{font-size:.84rem;color:var(--muted)}.model-picker>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px}.model-picker select{width:100%;min-width:0}
     .site-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:45px}.site-mark{margin-bottom:0}.sign-in{max-width:460px;margin:8vh auto}.sign-in h1{font-size:clamp(2.25rem,5vw,3.2rem)}.sign-in>p:not(.eyebrow){margin:8px 0 24px}.sign-in label{display:block;margin:18px 0;font-weight:650}.sign-in input{display:block;margin-top:7px}.sign-in .primary{width:100%;margin-top:5px}@media(max-width:650px){.site-header{margin-bottom:28px}}
+    :root{--bg:#071120;--panel:rgba(15,30,58,.64);--panel-2:rgba(25,48,86,.58);--line:rgba(156,190,245,.2);--text:#eef4ff;--muted:#a6b8d7;--accent:#4f8cff;--accent-2:#8bc5ff}
+    body{background:radial-gradient(ellipse at 12% -10%,rgba(53,111,225,.42) 0,transparent 34rem),radial-gradient(ellipse at 88% 2%,rgba(37,87,166,.38) 0,transparent 32rem),linear-gradient(145deg,#071120,#0a1630 48%,#07101f);background-attachment:fixed}
+    main{max-width:1320px;padding-top:36px}
+    .site-header{position:relative;padding:13px 17px;border:1px solid rgba(175,204,255,.16);border-radius:16px;background:rgba(9,22,47,.48);backdrop-filter:blur(22px) saturate(145%);box-shadow:0 14px 42px rgba(0,7,24,.25),inset 0 1px rgba(255,255,255,.06)}
+    .site-mark:before{box-shadow:0 7px 25px rgba(75,139,255,.34)}
+    .eyebrow{color:#8fc7ff}
+    .hero{align-items:center;padding:8px 0 24px;border-bottom:1px solid rgba(156,190,245,.14)}
+    .primary{background:linear-gradient(135deg,#4f8cff,#4269e8);box-shadow:0 10px 30px rgba(54,113,255,.25)}
+    .button:hover,button:not(.primary):hover{border-color:rgba(139,190,255,.65);background:rgba(95,150,240,.12)}
+    .chat-panel,.metadata,section,.processing,.edit-form,.filters,.table-wrap,.document-chat-dialog,.sign-in{background:linear-gradient(135deg,rgba(49,83,139,.24),rgba(12,27,54,.68));border:1px solid rgba(171,201,250,.2);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 22px 60px rgba(0,5,20,.29),inset 0 1px rgba(255,255,255,.07)}
+    .chat-panel,.metadata,.processing,.edit-form,.sign-in{border-radius:20px}
+    .filters,.table-wrap{border-radius:16px}
+    .filters{background:rgba(13,28,57,.48)}
+    .table-wrap{background:rgba(11,25,52,.52)}
+    th,td{border-bottom-color:rgba(156,190,245,.13)}
+    tbody tr:hover{background:rgba(79,140,255,.1)}
+    td a:hover,.clear,.back{color:#9ed0ff}
+    .tag{background:rgba(79,140,255,.14);border-color:rgba(139,190,255,.28);color:#c4e0ff}
+    .notice{background:rgba(54,115,220,.16);border-color:rgba(130,183,255,.3);color:#d2e6ff}
+    input,select,textarea{background:rgba(7,19,41,.62);border-color:rgba(156,190,245,.2)}
+    input:focus,select:focus,textarea:focus{border-color:#6eaeff;box-shadow:0 0 0 3px rgba(79,140,255,.2)}
+    .chat-answer{background:rgba(6,17,37,.48);border-color:rgba(156,190,245,.2)}
+    .document-chat-dialog{background:rgba(13,29,59,.82)}
+    .document-chat-dialog::backdrop{background:rgba(2,8,22,.72);backdrop-filter:blur(8px)}
+    .progress{background:rgba(4,14,32,.7)}
+    .progress>div{background:linear-gradient(90deg,#4f8cff,#9bd1ff)}
+    @media(max-width:650px){main{padding-top:24px}.site-header{padding:10px 12px;margin-bottom:24px}.hero{padding-bottom:18px}}
     </style></head><body><main><header class='site-header'><a class='site-mark' href='/'>Document Tagger</a>__ACCOUNT__</header>__BODY__</main></body></html>
     """.Replace("__TITLE__", H(title))
     .Replace("__ACCOUNT__", signedIn ? "<form method='post' action='/sign-out'><button class='button' type='submit'>Sign out</button></form>" : "")
