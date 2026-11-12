@@ -10,7 +10,8 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 - Renders PDF pages to images with `pdftoppm`
 - Extracts OCR text with Tesseract
 - Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
-- Streams chat answers into the browser as Ollama generates them, with progress feedback while it starts
+- Answers questions about the whole archive: a hybrid search index (SQLite FTS5 keywords plus Ollama embeddings) finds the relevant passages, dates, senders and categories in a question become filters, and list and count questions get the exact matching documents
+- Streams chat answers into the browser as Ollama generates them, with follow-up questions, progress feedback, and linked source documents
 - Lists installed Ollama models on the processing page and saves the selected model for future app requests
 - Copies documents into a date- and category-based folder structure
 - Provides a browser UI for searching, reviewing, editing, and reprocessing documents
@@ -21,13 +22,23 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 - .NET SDK 10.0.401
 - [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases) so `pdftoppm` is available on PATH, or set `PdfToPpmPath` in `appsettings.json`
 - [Tesseract OCR for Windows](https://github.com/UB-Mannheim/tesseract/wiki) so `tesseract.exe` is available on PATH, or set `TesseractPath` in `appsettings.json`
-- Ollama running locally with a model available for the app settings
+- Ollama 0.5 or later, with a chat model and an embedding model installed
 
-Install the default model used by the app:
+Install the recommended models:
 
 ```powershell
-ollama pull llama3.1
+ollama pull qwen2.5:7b        # chat and metadata; better at instructions and JSON than llama3.1:8b
+ollama pull nomic-embed-text  # small embedding model for semantic search
 ```
+
+Select the chat model on the processing page (or set `OllamaModel`). On a 6 GB GPU such as a GTX 1060, set these system environment variables and restart Ollama. They roughly halve the memory the 8K context needs, so it fits next to a 7B model:
+
+```powershell
+setx OLLAMA_FLASH_ATTENTION 1 /M
+setx OLLAMA_KV_CACHE_TYPE q8_0 /M
+```
+
+If answers are too slow, `qwen2.5:3b` or `gemma3:4b` are faster.
 
 ## Configuration
 
@@ -40,7 +51,15 @@ The settings live in `appsettings.json` under the `DocumentTagger` section:
     "ProcessedDirectory": "C:\\Users\\pharl\\Scans\\Processed",
     "DatabaseDirectory": "App_Data",
     "OllamaUrl": "http://localhost:11434",
-    "OllamaModel": "llama3.1:8b",
+    "OllamaModel": "qwen2.5:7b",
+    "EmbeddingModel": "nomic-embed-text",
+    "ChatContextTokens": 8192,
+    "AnalysisContextTokens": 8192,
+    "ChatTemperature": 0.2,
+    "ChunkSize": 1200,
+    "ChunkOverlap": 200,
+    "MaxContextChunks": 8,
+    "KeepAlive": "10m",
     "PdfToPpmPath": "C:\\path\\to\\Poppler\\Library\\bin\\pdftoppm.exe",
     "TesseractPath": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
     "RenderDpi": 300
@@ -56,6 +75,24 @@ Common settings:
 - `OllamaUrl` and `OllamaModel`: local Ollama endpoint and initial model; the processing page can select any installed model, saved in `DatabaseDirectory\ollama-model.txt` and used for future app requests
 - `PdfToPpmPath` and `TesseractPath`: full paths to the render and OCR executables (the Windows service cannot rely on your interactive PATH)
 - `RenderDpi`: OCR rendering resolution
+- `EmbeddingModel`: Ollama model for semantic search; leave empty for keyword search only. Changing it re-embeds every document in the background
+- `ChatContextTokens` and `AnalysisContextTokens`: the Ollama context window (`num_ctx`) for chat and for metadata extraction. Prompts are sized to fit, so nothing is silently cut. Keep the two equal, or Ollama reloads the model when it switches between them
+- `ChatTemperature`: lower values give more literal, factual answers
+- `ChunkSize`, `ChunkOverlap`: size of the OCR passages in the search index, in characters
+- `MaxContextChunks`: the most passages sent to the model for one archive question
+- `KeepAlive`: how long Ollama keeps models loaded between requests
+
+## How the chat finds answers
+
+1. Every document is split into a metadata card plus overlapping passages of OCR text. They are indexed for keyword search (SQLite FTS5 with stemming) and embedded for semantic search. Documents processed before this index existed are indexed in the background after startup. Progress shows on the processing page and at `/health`.
+2. The model first turns the question into a search plan: a standalone query (so follow-ups work), plus any date range, sender, addressee, category and intent (lookup, list, count or summarize).
+3. The filters narrow the documents. If nothing matches, they are relaxed instead of returning nothing. Keyword and semantic rankings are then merged, at most three passages per document.
+4. For list and count questions, the model also gets the exact number of matching documents and a one-line catalogue of them.
+5. The prompt is packed to fit the context window, with the question last, and the answer cites documents as `[#id]`, which become links.
+
+**Ask AI** on a single document sends the whole document when it fits, or otherwise its metadata and the passages most relevant to the question.
+
+After upgrading from an earlier version, use **Reprocess** on documents whose metadata looks wrong. Earlier versions did not size prompts to Ollama's context window, so the extraction rules were often cut off.
 
 ## Run
 
