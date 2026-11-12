@@ -18,6 +18,7 @@ Directory.CreateDirectory(settings.DatabaseDirectory);
 Directory.CreateDirectory(settings.ProcessedDirectory);
 
 builder.Services.AddSingleton(settings);
+builder.Services.AddSingleton<OllamaModelSelection>();
 builder.Services.AddHttpClient<OllamaClient>(client =>
 {
     client.BaseAddress = new Uri(settings.OllamaUrl);
@@ -139,8 +140,60 @@ app.MapPost("/process", (ProcessingStatus status, IServiceScopeFactory scopeFact
     return Results.Redirect("/processing");
 });
 
-app.MapGet("/processing", () => Results.Content(PageShell("Processing scans", ProcessingPage()), "text/html"));
+app.MapGet("/processing", (OllamaModelSelection models) => Results.Content(PageShell("Processing scans", ProcessingPage(models.CurrentModel)), "text/html"));
 app.MapGet("/api/processing", (ProcessingStatus status) => Results.Json(status.Snapshot()));
+app.MapGet("/api/ollama/models", async (OllamaClient ollama, OllamaModelSelection selection, CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var models = await ollama.GetAvailableModelsAsync(cancellationToken);
+        return Results.Json(new OllamaModelsResponse(selection.CurrentModel, models));
+    }
+    catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or JsonException)
+    {
+        return Results.Problem(ex.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+    {
+        return Results.Problem(ex.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetOllamaModels")
+.WithSummary("List installed Ollama models and the currently selected model")
+.Produces<OllamaModelsResponse>(StatusCodes.Status200OK)
+.ProducesProblem(StatusCodes.Status503ServiceUnavailable);
+
+app.MapPost("/api/ollama/model", async (SelectOllamaModelRequest request, OllamaClient ollama, OllamaModelSelection selection, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Model))
+        return Results.BadRequest(new { error = "Choose an installed Ollama model." });
+
+    IReadOnlyList<string> available;
+    try
+    {
+        available = await ollama.GetAvailableModelsAsync(cancellationToken);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or JsonException)
+    {
+        return Results.Problem(ex.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+    {
+        return Results.Problem(ex.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    var model = request.Model.Trim();
+    if (!available.Contains(model, StringComparer.Ordinal))
+        return Results.BadRequest(new { error = "That model is not available in Ollama." });
+
+    selection.Select(model);
+    return Results.Json(new SelectOllamaModelResponse(model));
+})
+.WithName("SelectOllamaModel")
+.WithSummary("Select an installed Ollama model for future requests")
+.Produces<SelectOllamaModelResponse>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status400BadRequest)
+.ProducesProblem(StatusCodes.Status503ServiceUnavailable);
 
 app.MapPost("/documents/{id:long}/reprocess", async (long id, DocumentProcessor processor) =>
 {
@@ -317,31 +370,93 @@ static string EditPage(DocumentRecord d, string? message) => $"""
     </form>
     """;
 
-static string ProcessingPage() => """
+static string ProcessingPage(string currentModel) => """
     <div class='processing'><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Processing scans</h1>
-    <p id='status' aria-live='polite'>Preparing your scan queue…</p><div class='progress'><div id='bar'></div></div>
+    <p id='status' aria-live='polite'>Preparing your scan queue…</p><div class='progress' role='progressbar' aria-label='Document processing progress'><div id='bar'></div></div>
     <p id='counter' class='count'></p><p class='hint'>Keep this page open while documents are being read, tagged and saved.</p>
-    <div id='complete' class='actions hidden'><a class='primary' href='/'>View document library</a></div></div>
+    <div id='complete' class='actions hidden'><a class='primary' href='/'>View document library</a></div>
+    <footer class='model-settings'>
+      <p class='eyebrow'>OLLAMA MODEL</p>
+      <p>Currently using <strong id='current-model'>__CURRENT_MODEL__</strong></p>
+      <div class='model-picker'><label for='model-select'>Choose an installed model</label>
+        <div><select id='model-select' disabled><option>Loading available models…</option></select>
+        <button id='model-save' type='button' disabled>Use model</button></div>
+      </div>
+      <p id='model-status' class='hint' role='status'>Changes apply to new Ollama requests.</p>
+    </footer></div>
     <script>
     async function refreshProgress() {
       try {
         const state = await fetch('/api/processing', {cache: 'no-store'}).then(r => r.json());
         document.getElementById('status').textContent = state.message;
         const total = state.total || 0;
+        const progress = document.querySelector('.progress');
+        const indeterminate = state.running && (!total || state.completed < total);
+        progress.classList.toggle('indeterminate', indeterminate);
         const percent = total ? Math.round((state.completed / total) * 100) : (state.running ? 8 : 100);
-        document.getElementById('bar').style.width = Math.min(100, percent) + '%';
+        const bar = document.getElementById('bar');
+        if (indeterminate) bar.style.removeProperty('width');
+        else bar.style.width = Math.min(100, percent) + '%';
         document.getElementById('counter').textContent = total ? `${state.completed} of ${total} document${total === 1 ? '' : 's'} handled` : '';
         if (!state.running) { document.getElementById('complete').classList.remove('hidden'); clearInterval(timer); }
       } catch { document.getElementById('status').textContent = 'Waiting for the local service…'; }
     }
     const timer = setInterval(refreshProgress, 800); refreshProgress();
+    const modelSelect = document.getElementById('model-select');
+    const modelSave = document.getElementById('model-save');
+    const modelStatus = document.getElementById('model-status');
+    async function loadOllamaModels() {
+      try {
+        const response = await fetch('/api/ollama/models', {cache: 'no-store'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || 'Could not load Ollama models.');
+        document.getElementById('current-model').textContent = data.currentModel;
+        modelSelect.replaceChildren(...data.models.map(model => {
+          const option = document.createElement('option');
+          option.value = model;
+          option.textContent = model;
+          return option;
+        }));
+        if (data.models.includes(data.currentModel)) modelSelect.value = data.currentModel;
+        modelSelect.disabled = data.models.length === 0;
+        modelSave.disabled = data.models.length === 0;
+        modelStatus.textContent = data.models.length ? 'Changes apply to new Ollama requests.' : 'No installed Ollama models were found.';
+      } catch (error) {
+        modelSelect.replaceChildren(new Option('Could not load available models', ''));
+        modelSelect.disabled = true;
+        modelSave.disabled = true;
+        modelStatus.textContent = error.message;
+      }
+    }
+    modelSave.addEventListener('click', async () => {
+      modelSave.disabled = true;
+      modelStatus.textContent = 'Saving model selection…';
+      try {
+        const response = await fetch('/api/ollama/model', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({model: modelSelect.value})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || 'Could not select that Ollama model.');
+        document.getElementById('current-model').textContent = data.model;
+        modelStatus.textContent = 'Model saved. New Ollama requests will use ' + data.model + '.';
+      } catch (error) {
+        modelStatus.textContent = error.message;
+      } finally {
+        modelSave.disabled = modelSelect.disabled;
+      }
+    });
+    loadOllamaModels();
     </script>
-    """;
+    """.Replace("__CURRENT_MODEL__", H(currentModel));
 
 static string PageShell(string title, string body, bool signedIn = true) => """
     <!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>__TITLE__ · Document Tagger</title><style>
     :root{color-scheme:dark;--bg:#090d18;--panel:#12192a;--panel-2:#182135;--line:#2a3550;--text:#f0f4ff;--muted:#99a7c2;--accent:#7c8cff;--accent-2:#5eead4;--danger:#ff9ca8}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 12% -10%,#233a68 0,transparent 31rem),radial-gradient(ellipse at 85% 0,#203953 0,transparent 30rem),var(--bg);color:var(--text);font:15px/1.55 Inter,Segoe UI,Arial,sans-serif}body:before{content:'';position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(to bottom,black,transparent 70%)}main{max-width:1240px;margin:auto;padding:52px 28px 80px;position:relative}.site-mark{display:flex;gap:11px;align-items:center;color:#d9e1fa;font-weight:700;text-decoration:none;letter-spacing:-.02em;margin-bottom:45px}.site-mark:before{content:'✦';display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#0b1020;box-shadow:0 7px 25px rgba(94,234,212,.23)}h1{font-size:clamp(2.25rem,5vw,4.1rem);letter-spacing:-.055em;line-height:1.02;margin:.12em 0 .2em}h2{font-size:1.08rem;margin:0 0 20px}.hero,.detail-head{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:34px}.eyebrow{letter-spacing:.14em;font-weight:700;color:var(--accent-2);font-size:.7rem;margin:0}.hero p:not(.eyebrow),.detail-head>div>p,.edit-heading p:not(.eyebrow){color:var(--muted);margin:8px 0;max-width:580px}.primary,.button,button{border:1px solid var(--line);background:rgba(255,255,255,.03);padding:10px 15px;border-radius:9px;color:var(--text);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;display:inline-block;transition:.18s ease}.primary{border-color:transparent;background:linear-gradient(135deg,var(--accent),#6672e9);box-shadow:0 10px 30px rgba(92,109,239,.22)}.primary:hover{filter:brightness(1.1);transform:translateY(-1px)}.button:hover,button:not(.primary):hover{border-color:#65759a;background:rgba(255,255,255,.07)}.filters{display:flex;flex-wrap:wrap;gap:10px;padding:13px;background:rgba(18,25,42,.8);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:13px;box-shadow:0 16px 40px rgba(0,0,0,.17)}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 11px;font:inherit;color:var(--text);background:#0c1322;outline:none;transition:border .18s,box-shadow .18s}input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,140,255,.17)}select{width:auto;min-width:145px}input[name=name],input[name=content]{flex:1;min-width:210px}.filters input{width:auto;min-width:135px}.clear,.back{color:var(--accent-2);padding:10px;text-decoration:none}.count{color:var(--muted);font-size:.87rem;margin:18px 2px}.table-wrap{overflow:auto;background:rgba(18,25,42,.8);border:1px solid var(--line);border-radius:13px;box-shadow:0 18px 46px rgba(0,0,0,.17)}table{width:100%;border-collapse:collapse;min-width:900px}th,td{padding:17px;text-align:left;border-bottom:1px solid rgba(42,53,80,.8);vertical-align:top}tbody tr:last-child td{border-bottom:0}tbody tr{transition:background .18s}tbody tr:hover{background:rgba(124,140,255,.06)}th{color:var(--muted);font-size:.69rem;letter-spacing:.1em;text-transform:uppercase;font-weight:700}td a{color:#dce3ff;font-weight:700;text-decoration:none}td a:hover{color:var(--accent-2)}small{display:block;color:var(--muted);margin-top:3px}.tag{display:inline-block;background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.17);border-radius:99px;padding:2px 8px;margin:1px;color:#a4f5e7;font-size:.79rem}.empty{text-align:center;color:var(--muted);padding:48px}.notice{background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.25);padding:12px 15px;margin:0 0 22px;border-radius:9px;color:#baf9ee}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.actions form{margin:0}.metadata,section,.processing,.edit-form{background:rgba(18,25,42,.82);backdrop-filter:blur(16px);border:1px solid var(--line);padding:26px;border-radius:13px;margin:22px 0;box-shadow:0 18px 46px rgba(0,0,0,.14)}.processing{max-width:650px;margin:80px auto}.chat-panel{display:grid;grid-template-columns:minmax(240px,1fr) minmax(400px,2fr);gap:18px;align-items:end}.chat-panel .chat-answer{grid-column:1/-1}.chat-help{color:var(--muted);margin:0}.chat-form{display:flex;gap:10px;align-items:end}.chat-form textarea{min-height:58px;resize:vertical}.chat-form button{white-space:nowrap}.chat-answer{min-height:48px;padding:14px 16px;color:#dbe3f7;background:rgba(7,12,25,.62);border:1px solid var(--line);border-radius:9px;white-space:pre-wrap}.document-chat{padding:7px 10px;font-size:.82rem;white-space:nowrap}.document-chat-dialog{width:min(620px,calc(100% - 28px));padding:28px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.48)}.document-chat-dialog::backdrop{background:rgba(2,5,12,.76);backdrop-filter:blur(4px)}.document-chat-dialog h2{margin:6px 0 20px}.document-chat-dialog textarea{margin:0 0 12px;resize:vertical}.dialog-close{float:right}.dialog-close button{font-size:1.4rem;line-height:1;padding:4px 10px}.progress{height:10px;background:#0a1020;border-radius:99px;overflow:hidden;margin:24px 0 10px}.progress>div{height:100%;width:4%;background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:99px;transition:width .35s ease}.hint{color:var(--muted)}.hidden{display:none}dl{display:grid;grid-template-columns:170px 1fr;gap:13px 20px;margin:0}dt{font-weight:650;color:var(--muted)}dd{margin:0}pre{white-space:pre-wrap;font:13px/1.65 ui-monospace,Consolas,monospace;margin:0;color:#cbd5ed}.edit-heading{margin-bottom:28px}.edit-form{max-width:920px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 18px;margin-bottom:18px}.edit-form label{display:block;font-size:.84rem;font-weight:700;color:#ccd5ec;margin:17px 0}.form-grid label{margin:0}.edit-form label span{font-size:.75rem;color:var(--muted);font-weight:500;margin-left:4px}.edit-form input,.edit-form textarea{display:block;margin-top:7px}.edit-form textarea{resize:vertical}.ocr-input{font:13px/1.5 ui-monospace,Consolas,monospace;color:#cbd5ed}@media(max-width:800px){.chat-panel{display:block}.chat-form{display:block}.chat-form button{margin-top:10px}}@media(max-width:650px){main{padding:30px 16px}.site-mark{margin-bottom:28px}.hero,.detail-head{display:block}.hero form{margin-top:20px}.form-grid{grid-template-columns:1fr}dl{grid-template-columns:1fr;gap:4px}dd{margin-bottom:13px}.filters input,.filters select{width:100%;flex:auto}}
+    .progress.indeterminate>div{width:35%;animation:progress-slide 1.4s ease-in-out infinite}@keyframes progress-slide{from{transform:translateX(-110%)}to{transform:translateX(310%)}}
+    .model-settings{border-top:1px solid var(--line);margin-top:30px;padding-top:20px}.model-settings>p:not(.eyebrow){margin:8px 0}.model-picker{display:grid;gap:7px;margin-top:18px}.model-picker label{font-size:.84rem;color:var(--muted)}.model-picker>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px}.model-picker select{width:100%;min-width:0}
     .site-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:45px}.site-mark{margin-bottom:0}.sign-in{max-width:460px;margin:8vh auto}.sign-in h1{font-size:clamp(2.25rem,5vw,3.2rem)}.sign-in>p:not(.eyebrow){margin:8px 0 24px}.sign-in label{display:block;margin:18px 0;font-weight:650}.sign-in input{display:block;margin-top:7px}.sign-in .primary{width:100%;margin-top:5px}@media(max-width:650px){.site-header{margin-bottom:28px}}
     </style></head><body><main><header class='site-header'><a class='site-mark' href='/'>Document Tagger</a>__ACCOUNT__</header>__BODY__</main></body></html>
     """.Replace("__TITLE__", H(title))
@@ -428,6 +543,33 @@ sealed class TaggerSettings
     public int RenderDpi { get; set; } = 300;
 }
 
+sealed class OllamaModelSelection(TaggerSettings settings)
+{
+    private readonly object gate = new();
+    private readonly string modelPath = Path.Combine(settings.DatabaseDirectory, "ollama-model.txt");
+    private string currentModel = LoadModel(Path.Combine(settings.DatabaseDirectory, "ollama-model.txt"), settings.OllamaModel);
+
+    public string CurrentModel { get { lock (gate) return currentModel; } }
+
+    public void Select(string model)
+    {
+        lock (gate)
+        {
+            var temporaryPath = modelPath + ".tmp";
+            File.WriteAllText(temporaryPath, model);
+            File.Move(temporaryPath, modelPath, true);
+            currentModel = model;
+        }
+    }
+
+    private static string LoadModel(string path, string fallback)
+    {
+        if (!File.Exists(path)) return fallback;
+        var savedModel = File.ReadAllText(path).Trim();
+        return string.IsNullOrWhiteSpace(savedModel) ? fallback : savedModel;
+    }
+}
+
 sealed class ProcessingStatus
 {
     private readonly object gate = new();
@@ -491,8 +633,17 @@ sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient
     {
         var text = await ocr.ReadPdfAsync(sourcePath, stage);
         if (string.IsNullOrWhiteSpace(text)) throw new InvalidOperationException("OCR returned no readable text.");
-        stage?.Invoke("asking Ollama to identify the document and extract metadata…");
-        var analysis = await ollama.AnalyseAsync(text, Path.GetFileName(sourcePath));
+        var fileName = Path.GetFileName(sourcePath);
+        stage?.Invoke($"Ollama is starting metadata analysis for {fileName}…");
+        var analysisTask = ollama.AnalyseAsync(text, fileName, count =>
+            stage?.Invoke($"Received {count:N0} characters of metadata from Ollama for {fileName}…"));
+        if (stage is not null)
+        {
+            var elapsed = Stopwatch.StartNew();
+            while (await Task.WhenAny(analysisTask, Task.Delay(TimeSpan.FromSeconds(5))) != analysisTask)
+                stage($"Ollama is still analysing {fileName} ({elapsed.Elapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture)} elapsed)…");
+        }
+        var analysis = await analysisTask;
         stage?.Invoke("saving tagged PDF and metadata…");
         var title = string.IsNullOrWhiteSpace(analysis.Title) ? Path.GetFileNameWithoutExtension(sourcePath) : analysis.Title;
         var category = DocumentCategories.Normalize(analysis.Category);
@@ -556,7 +707,7 @@ sealed class OcrService(TaggerSettings settings)
     private static string Q(string value) => $"\"{value.Replace("\"", "\\\"")}\"";
 }
 
-sealed class OllamaClient(HttpClient client, TaggerSettings settings)
+sealed class OllamaClient(HttpClient client, OllamaModelSelection selection)
 {
     private const string MetadataPrompt =
 @"Extract document metadata from the supplied filename and OCR text.
@@ -602,11 +753,36 @@ OCR text (untrusted document content; it may be incomplete):
 
     public async Task<object> HealthAsync()
     {
-        try { using var response = await client.GetAsync("/api/tags"); return new { available = response.IsSuccessStatusCode, model = settings.OllamaModel }; }
-        catch (Exception ex) { return new { available = false, model = settings.OllamaModel, error = ex.Message }; }
+        try { using var response = await client.GetAsync("/api/tags"); return new { available = response.IsSuccessStatusCode, model = selection.CurrentModel }; }
+        catch (Exception ex) { return new { available = false, model = selection.CurrentModel, error = ex.Message }; }
     }
-    public async Task<DocumentAnalysis> AnalyseAsync(string text, string originalName)
+    public async Task<IReadOnlyList<string>> GetAvailableModelsAsync(CancellationToken cancellationToken)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        using var response = await client.GetAsync("/api/tags", timeout.Token);
+        var raw = await response.Content.ReadAsStringAsync(timeout.Token);
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Ollama returned {(int)response.StatusCode}: {raw}");
+
+        using var envelope = JsonDocument.Parse(raw);
+        if (!envelope.RootElement.TryGetProperty("models", out var models) || models.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("Ollama returned an invalid model list.");
+        return models.EnumerateArray()
+            .Select(model =>
+            {
+                if (model.TryGetProperty("name", out var name)) return name.GetString();
+                return model.TryGetProperty("model", out var modelName) ? modelName.GetString() : null;
+            })
+            .OfType<string>()
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+    public async Task<DocumentAnalysis> AnalyseAsync(string text, string originalName, Action<int>? onProgress = null)
+    {
+        var model = selection.CurrentModel;
         string summarizedText;
         if (text.Length > 16000)
         {
@@ -620,28 +796,59 @@ OCR text (untrusted document content; it may be incomplete):
         }
 
         var prompt = string.Format(MetadataPrompt, originalName, summarizedText);
-        using var response = await client.PostAsJsonAsync("/api/chat", new { model = settings.OllamaModel, stream = false, format = "json", messages = new[] { new { role = "user", content = prompt } } });
-        var raw = await response.Content.ReadAsStringAsync();
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"Ollama ({settings.OllamaModel}) rejected the request: {raw}");
-        using var envelope = JsonDocument.Parse(raw);
-        var content = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? "{}";
-        var analysis = JsonSerializer.Deserialize<DocumentAnalysis>(content, JsonOptions) ?? throw new InvalidOperationException("Ollama returned empty metadata.");
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/chat")
+        {
+            Content = JsonContent.Create(new { model, stream = true, format = "json", messages = new[] { new { role = "user", content = prompt } } })
+        };
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        if (!response.IsSuccessStatusCode)
+        {
+            var raw = await response.Content.ReadAsStringAsync();
+            throw new InvalidOperationException($"Ollama ({model}) rejected the request: {raw}");
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream);
+        var metadataContent = new StringBuilder();
+        var nextProgressLength = 100;
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            using var envelope = JsonDocument.Parse(line);
+            var root = envelope.RootElement;
+            if (root.TryGetProperty("error", out var error)) throw new InvalidOperationException(error.GetString() ?? "Ollama returned an error.");
+            if (root.TryGetProperty("message", out var message) &&
+                message.TryGetProperty("content", out var content) &&
+                content.GetString() is { Length: > 0 } chunk)
+            {
+                metadataContent.Append(chunk);
+                if (metadataContent.Length >= nextProgressLength)
+                {
+                    onProgress?.Invoke(metadataContent.Length);
+                    nextProgressLength = metadataContent.Length + 100;
+                }
+            }
+        }
+
+        onProgress?.Invoke(metadataContent.Length);
+        var metadataJson = metadataContent.Length > 0 ? metadataContent.ToString() : "{}";
+        var analysis = JsonSerializer.Deserialize<DocumentAnalysis>(metadataJson, JsonOptions) ?? throw new InvalidOperationException("Ollama returned empty metadata.");
         return analysis with { Tags = analysis.Tags?.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new(), Keywords = analysis.Keywords?.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new() };
     }
     public async Task<string> StreamAnswerAsync(string question, IReadOnlyList<DocumentRecord> documents, Func<string, Task> onChunk, CancellationToken cancellationToken)
     {
+        var model = selection.CurrentModel;
         var context = string.Join("\n\n", documents.Select(document => string.Join("\n", "DOCUMENT " + document.Id + ": " + document.Title, "Date: " + (document.DocumentDate?.ToString("yyyy-MM-dd") ?? "unknown"), "From: " + (document.Sender ?? "unknown"), "To: " + (document.Addressee ?? "unknown"), "Summary: " + document.Summary, "Text: " + document.OcrText[..Math.Min(document.OcrText.Length, 5000)])));
         if (string.IsNullOrWhiteSpace(context)) context = "No documents have been indexed yet.";
         var prompt = $"You answer questions about a private document archive. Use only the document context below. Match names and other entities exactly before answering; never substitute a different person or document. If the requested person or fact is not present in the context, say you could not find it in the indexed documents. Cite relevant document titles in your answer. Be concise and do not invent facts.\n\nQuestion: {question.Trim()}\n\nDocument context:\n{context}";
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/chat")
         {
-            Content = JsonContent.Create(new { model = settings.OllamaModel, stream = true, messages = new[] { new { role = "user", content = prompt } } })
+            Content = JsonContent.Create(new { model, stream = true, messages = new[] { new { role = "user", content = prompt } } })
         };
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             var raw = await response.Content.ReadAsStringAsync(cancellationToken);
-            throw new InvalidOperationException($"Ollama ({settings.OllamaModel}) rejected the request: {raw}");
+            throw new InvalidOperationException($"Ollama ({model}) rejected the request: {raw}");
         }
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -834,6 +1041,15 @@ record DocumentAnalysis(string? Title, DateOnly? DocumentDate, string? Sender, s
 record ProcessingUpdate(int Completed, int Total, string Message);
 record ProcessingSnapshot(bool Running, int Completed, int Total, string Message);
 record DocumentQuery(string? Name = null, string? Content = null, string? Tag = null, string? From = null, string? To = null, string? Message = null) { public static DocumentQuery Parse(IQueryCollection q) => new(q["name"].ToString(), q["content"].ToString(), q["tag"].ToString(), q["from"].ToString(), q["to"].ToString(), q["message"].ToString()); }
+
+/// <summary>Lists the installed Ollama models and the model currently selected by the application.</summary>
+sealed record OllamaModelsResponse(string CurrentModel, IReadOnlyList<string> Models);
+
+/// <summary>Selects an installed Ollama model for future requests.</summary>
+sealed record SelectOllamaModelRequest(string? Model);
+
+/// <summary>Confirms the Ollama model selected for future requests.</summary>
+sealed record SelectOllamaModelResponse(string Model);
 
 static class DocumentCategories
 {

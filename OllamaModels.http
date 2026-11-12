@@ -1,0 +1,15 @@
+@baseUrl = http://localhost:5248
+@authCookie = REPLACE_WITH_YOUR_AUTH_COOKIE
+
+### List installed models and the current selection
+GET {{baseUrl}}/api/ollama/models
+Cookie: DocumentTagger.Auth={{authCookie}}
+
+### Select an installed model
+POST {{baseUrl}}/api/ollama/model
+Cookie: DocumentTagger.Auth={{authCookie}}
+Content-Type: application/json
+
+{
+  "model": "qwen3.5:4b"
+}

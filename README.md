@@ -11,6 +11,7 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 - Extracts OCR text with Tesseract
 - Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
 - Streams chat answers into the browser as Ollama generates them, with progress feedback while it starts
+- Lists installed Ollama models on the processing page and saves the selected model for future app requests
 - Copies documents into a date- and category-based folder structure
 - Provides a browser UI for searching, reviewing, editing, and reprocessing documents
 - Requires the Castle account to sign in before using the site
@@ -52,7 +53,7 @@ Common settings:
 - `ScansDirectory`: where new PDFs are discovered
 - `ProcessedDirectory`: where processed PDFs are saved
 - `DatabaseDirectory`: folder for the SQLite database (`documents.db`)
-- `OllamaUrl` and `OllamaModel`: local Ollama endpoint and model name
+- `OllamaUrl` and `OllamaModel`: local Ollama endpoint and initial model; the processing page can select any installed model, saved in `DatabaseDirectory\ollama-model.txt` and used for future app requests
 - `PdfToPpmPath` and `TesseractPath`: full paths to the render and OCR executables (the Windows service cannot rely on your interactive PATH)
 - `RenderDpi`: OCR rendering resolution
 
