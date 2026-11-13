@@ -18,8 +18,9 @@ sealed record DuplicateMatch(long DocumentId, double Similarity);
 
 /// <summary>
 /// Spots a rescan of a document that is already in the library by comparing OCR text.
-/// Two scans of the same page never produce identical files or identical OCR, so the score averages the overlap of
-/// the words and of adjacent word pairs: a misread word costs little, while the word order still has to match.
+/// Two scans of the same page never produce identical files or identical OCR, so the score combines overlap of
+/// words, adjacent word pairs, and character trigrams built without whitespace. This reduces the effect of OCR
+/// spacing errors while preserving a preference for matching words in order.
 /// A separate check on the numbers stops a new monthly bill from the same company — same wording, different
 /// dates and amounts — from looking like a duplicate of last month's. That check is deliberately looser than the
 /// text score, because OCR often misreads a digit or two in an otherwise identical rescan.
@@ -39,18 +40,24 @@ static partial class DuplicateDetector
         foreach (var (id, candidateText) in candidates)
         {
             // Jaccard similarity can never exceed the ratio of the two sizes, so skip documents of very different length cheaply.
-            var lengthRatio = (double)Math.Min(text.Length, candidateText.Length) / Math.Max(1, Math.Max(text.Length, candidateText.Length));
+            var scanLength = NonWhitespaceLength(text);
+            var candidateLength = NonWhitespaceLength(candidateText);
+            var lengthRatio = (double)Math.Min(scanLength, candidateLength) / Math.Max(1, Math.Max(scanLength, candidateLength));
             if (lengthRatio < threshold * 0.6) continue;
 
             var candidate = Fingerprint.Create(candidateText);
             if (candidate.WordCount < MinimumWords) continue;
-            var similarity = (Jaccard(scan.Words, candidate.Words) + Jaccard(scan.WordPairs, candidate.WordPairs)) / 2;
+            var similarity = Jaccard(scan.Words, candidate.Words) * 0.35
+                + Jaccard(scan.WordPairs, candidate.WordPairs) * 0.35
+                + Jaccard(scan.CharacterTrigrams, candidate.CharacterTrigrams) * 0.30;
             if (similarity < threshold) continue;
             if (scan.Numbers.Count >= MinimumNumbers && candidate.Numbers.Count >= MinimumNumbers && Jaccard(scan.Numbers, candidate.Numbers) < MinimumNumberOverlap) continue;
             if (best is null || similarity > best.Similarity) best = new DuplicateMatch(id, similarity);
         }
         return best;
     }
+
+    private static int NonWhitespaceLength(string text) => text.Count(character => !char.IsWhiteSpace(character));
 
     private static double Jaccard<T>(HashSet<T> left, HashSet<T> right)
     {
@@ -60,19 +67,23 @@ static partial class DuplicateDetector
         return (double)shared / (left.Count + right.Count - shared);
     }
 
-    private sealed record Fingerprint(HashSet<string> Words, HashSet<string> WordPairs, HashSet<string> Numbers, int WordCount)
+    private sealed record Fingerprint(HashSet<string> Words, HashSet<string> WordPairs, HashSet<string> CharacterTrigrams, HashSet<string> Numbers, int WordCount)
     {
         public static Fingerprint Create(string text)
         {
             var lower = text.ToLowerInvariant();
+            var compact = string.Concat(lower.Where(character => !char.IsWhiteSpace(character)));
             // Single characters are mostly OCR noise (stray marks, broken letters), so they are ignored.
             var words = WordPattern().Matches(lower).Select(match => match.Value).Where(word => word.Length > 1).ToList();
             var pairs = new HashSet<string>(StringComparer.Ordinal);
             for (var i = 1; i < words.Count; i++) pairs.Add(words[i - 1] + " " + words[i]);
+            var characterTrigrams = new HashSet<string>(StringComparer.Ordinal);
+            for (var i = 0; i <= compact.Length - 3; i++)
+                characterTrigrams.Add(compact.Substring(i, 3));
             // Dates, amounts and references, compared on their digits only: "84.20" and "84,20" both become "8420".
             var numbers = NumberPattern().Matches(lower).Select(match => new string(match.Value.Where(char.IsDigit).ToArray()))
                 .Where(digits => digits.Length >= 2).ToHashSet(StringComparer.Ordinal);
-            return new Fingerprint(words.ToHashSet(StringComparer.Ordinal), pairs, numbers, words.Count);
+            return new Fingerprint(words.ToHashSet(StringComparer.Ordinal), pairs, characterTrigrams, numbers, words.Count);
         }
     }
 

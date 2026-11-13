@@ -284,10 +284,12 @@ app.MapPost("/api/ollama/model", async (SelectOllamaModelRequest request, Ollama
 .Produces(StatusCodes.Status400BadRequest)
 .ProducesProblem(StatusCodes.Status503ServiceUnavailable);
 
-app.MapPost("/documents/{id:long}/reprocess", async (long id, DocumentProcessor processor) =>
+app.MapPost("/documents/{id:long}/reprocess", (long id, DocumentStore store, ProcessingStatus status, IServiceScopeFactory scopeFactory) =>
 {
-    var result = await processor.ReprocessAsync(id);
-    return Results.Redirect($"/documents/{id}?message={Uri.EscapeDataString(result)}");
+    var document = store.Get(id);
+    if (document is null) return Results.NotFound("Document not found.");
+    StartReprocessing(document, status, scopeFactory);
+    return Results.Redirect("/processing");
 });
 
 app.MapGet("/documents/{id:long}", (long id, HttpRequest request, DocumentStore store) =>
@@ -371,7 +373,10 @@ static string ListView(DocumentQuery query, IReadOnlyList<DocumentListItem> docu
         return $"<tr class='doc-row{LabelColours.AccentClass(LabelColours.ForDocument(d.Tags, d.Category, colours))}'><td class='col-name'><a href='/documents/{d.Id}'>{H(d.Title)}</a><small>{H(d.OriginalFileName)}</small></td>" +
             $"<td class='col-date' data-label='Date'>{date}</td><td class='col-to col-people' data-label='To'>{H(d.Addressee ?? "—")}</td><td class='col-from col-people' data-label='From'>{H(d.Sender ?? "—")}</td>" +
             $"<td class='col-tags'>{CategoryChip(d.Category, colours)}{string.Join("", d.Tags.Select(tag => TagChip(tag, colours)))}</td>" +
-            $"<td class='col-summary'>{H(Trim(d.Summary, 130))}</td><td class='col-ai'><button type='button' class='document-chat' data-id='{d.Id}' data-title='{A(d.Title)}'>Ask AI</button></td></tr>";
+            $"<td class='col-summary'>{H(Trim(d.Summary, 130))}</td><td class='col-ai' data-label='Actions'><div class='document-actions'>" +
+            $"<button type='button' class='document-chat' data-id='{d.Id}' data-title='{A(d.Title)}'><svg class='action-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'/></svg><span>Ask AI</span></button>" +
+            $"<form method='post' action='/documents/{d.Id}/reprocess'><button type='submit' class='document-reprocess'><svg class='action-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M20 11a8.1 8.1 0 0 0-14.6-4L4 9'/><path d='M4 5v4h4'/><path d='M4 13a8.1 8.1 0 0 0 14.6 4L20 15'/><path d='M20 19v-4h-4'/></svg><span>Reprocess</span></button></form>" +
+            "</div></td></tr>";
     }));
     if (rows.Length == 0) rows = $"<tr><td colspan='7' class='empty'>{(query.HasFilters ? "No documents match your search." : "No documents yet. Put scans in the scans folder and click Process scans.")}</td></tr>";
 
@@ -453,18 +458,23 @@ static string HomePage(DocumentQuery query, string results, IReadOnlyList<string
         message += $"<div class='notice filter-notice' role='status'><span>Showing documents scanned on {scannedOn.ToString("d MMMM yyyy", CultureInfo.InvariantCulture)}.</span><a href='{A((query with { Scanned = null, Page = 1 }).Url())}'>Show all</a></div>";
     var options = string.Join("", suggestions.Select(tag => $"<option value='{A(tag)}'></option>"));
     var activeFilters = new[] { query.Name, query.Content, query.Tag, query.From, query.To }.Count(value => !string.IsNullOrWhiteSpace(value));
-    var filterSummary = activeFilters == 0 ? "Search and filter" : $"Search and filter <span class='filter-count'>{activeFilters} active</span>";
+    var filterCount = activeFilters == 0 ? "" : $"<span class='filter-count'>{activeFilters}</span>";
     var listUrl = A((query with { View = "list", Page = 1 }).Url());
     var calendarUrl = A((query with { View = "calendar", Page = 1 }).Url());
     var clearUrl = A(new DocumentQuery(View: query.View, By: query.By, Month: query.IsCalendar ? query.Month : null).Url());
     return $$"""
-        <div class='hero'><div><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Scanned documents</h1><p>OCR, tags and search stay on this computer.</p></div>
-        <form method='post' action='/process'><button class='primary'>Process scans</button></form></div>{{message}}
-        <section class='chat-panel'><div class='chat-intro'><p class='eyebrow'>ASK YOUR ARCHIVE</p><h2>What do you need to find?</h2><p class='chat-help'>Ask about dates, people, payments or renewals, or ask for lists and counts such as “list all bills from 2025”. Follow-up questions use the conversation so far.</p></div>
+        <div class='hero'><div><p class='eyebrow'>LOCAL DOCUMENT LIBRARY</p><h1>Scanned documents</h1><p>OCR, tags and search stay on this computer.</p></div></div>{{message}}
+        <div class='home-tools' aria-label='Library tools'>
+          <button id='archive-toggle' class='primary panel-toggle' type='button' aria-expanded='false' aria-controls='archive-panel'><svg class='panel-toggle-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'/></svg><span>Ask Ollama</span></button>
+          <button id='filter-toggle' class='primary panel-toggle' type='button' aria-expanded='{{(activeFilters > 0 ? "true" : "false")}}' aria-controls='filter-panel'><svg class='panel-toggle-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 21v-7'/><path d='M4 10V3'/><path d='M12 21v-9'/><path d='M12 8V3'/><path d='M20 21v-5'/><path d='M20 12V3'/><path d='M2 14h4'/><path d='M10 8h4'/><path d='M18 16h4'/></svg><span>Filter</span>{{filterCount}}</button>
+          <form method='post' action='/process'><button class='primary process-button' type='submit'>Process scans</button></form>
+        </div>
+        <details class='chat-panel collapsible-panel' id='archive-panel' aria-labelledby='archive-toggle'><summary>Ask your archive</summary><div class='chat-panel-content'>
+        <div class='chat-intro'><p class='eyebrow'>ASK YOUR ARCHIVE</p><h2>What do you need to find?</h2><p class='chat-help'>Ask about dates, people, payments or renewals, or ask for lists and counts such as “list all bills from 2025”. Follow-up questions use the conversation so far.</p></div>
         <div id='chat-thread' class='chat-thread' aria-live='polite'></div>
         <form id='chat-form' class='chat-form'><label class='visually-hidden' for='chat-question'>Question</label><textarea id='chat-question' rows='2' placeholder='e.g. When does my car insurance renew?' required></textarea>
-        <div class='chat-buttons'><button class='primary' type='submit'>Ask Ollama</button><button type='button' id='chat-reset' class='button hidden'>New conversation</button></div></form></section>
-        <details class='filter-panel'{{(activeFilters > 0 ? " open" : "")}}><summary>{{filterSummary}}</summary>
+        <div class='chat-buttons'><button class='primary' type='submit'>Ask Ollama</button><button type='button' id='chat-reset' class='button hidden'>New conversation</button></div></form></div></details>
+        <details class='filter-panel collapsible-panel' id='filter-panel'{{(activeFilters > 0 ? " open" : "")}} aria-labelledby='filter-toggle'><summary>Search and filter</summary>
         <form class='filters' method='get'>{{HiddenFilters(query, "name", "content", "tag", "from", "to")}}
         <label class='filter-wide'>Name<input name='name' value='{{A(query.Name)}}' placeholder='Title, sender or addressee'></label>
         <label class='filter-wide'>Text<input name='content' value='{{A(query.Content)}}' placeholder='Words in the OCR text'></label>
@@ -540,8 +550,30 @@ static string LabelsPage(IReadOnlyList<(string Label, int Count)> categories, IR
 static string ChatScript() => """
     <script>
     const touchKeyboard = matchMedia('(pointer: coarse)').matches;
-    const filterPanel = document.querySelector('.filter-panel');
-    if (filterPanel && matchMedia('(min-width: 801px)').matches) filterPanel.open = true;
+    for (const toggle of document.querySelectorAll('.panel-toggle')) {
+      const panel = document.getElementById(toggle.getAttribute('aria-controls'));
+      const stateKey = 'document-tagger-panel:' + panel.id;
+      try {
+        const savedState = localStorage.getItem(stateKey);
+        if (savedState !== null) panel.open = savedState === 'open';
+      } catch (error) {
+        console.warn('Could not restore the ' + panel.id + ' panel state.', error);
+      }
+      const updateState = () => {
+        toggle.setAttribute('aria-expanded', String(panel.open));
+        try {
+          localStorage.setItem(stateKey, panel.open ? 'open' : 'closed');
+        } catch (error) {
+          console.warn('Could not save the ' + panel.id + ' panel state.', error);
+        }
+      };
+      toggle.addEventListener('click', () => {
+        panel.open = !panel.open;
+        updateState();
+      });
+      panel.addEventListener('toggle', updateState);
+      updateState();
+    }
     async function askChat(payload, output, sources) {
       let receivedAnswer = false;
       let complete = null;
@@ -714,6 +746,35 @@ static bool StartProcessing(ProcessingStatus status, IServiceScopeFactory scopeF
     return true;
 }
 
+static void StartReprocessing(DocumentRecord document, ProcessingStatus status, IServiceScopeFactory scopeFactory)
+{
+    if (!status.TryBegin()) return;
+    _ = Task.Run(async () =>
+    {
+        var fileName = document.OriginalFileName;
+        status.Report(new ProcessingUpdate(0, 1, $"Preparing to reprocess {fileName}…", fileName,
+            new ScanProgress(ScanSteps.Render, "Preparing the document…")));
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var processor = scope.ServiceProvider.GetRequiredService<DocumentProcessor>();
+            var result = await processor.ReprocessAsync(document.Id, scan =>
+                status.Report(new ProcessingUpdate(0, 1, $"Reprocessing {fileName}: {scan.Message}", fileName, scan)));
+            status.AddResult(result);
+            status.Report(new ProcessingUpdate(1, 1, result.Detail));
+            if (result.Outcome == "saved") status.Complete($"Reprocessed {fileName}.");
+            else status.Fail(result.Detail);
+        }
+        catch (Exception ex)
+        {
+            var failure = new ProcessingResult(fileName, "failed", $"Reprocessing failed: {ex.Message}");
+            status.AddResult(failure);
+            status.Report(new ProcessingUpdate(1, 1, failure.Detail));
+            status.Fail(failure.Detail);
+        }
+    });
+}
+
 static string ReviewsPage(IReadOnlyList<(ScanReview Review, DocumentRecord? Existing)> items, string? message, string duplicatesFolder)
 {
     var notice = string.IsNullOrWhiteSpace(message) ? "" : $"<div class='notice' role='status'>{H(message)}</div>";
@@ -728,8 +789,8 @@ static string ReviewsPage(IReadOnlyList<(ScanReview Review, DocumentRecord? Exis
             : $"Its text is <strong>{Math.Round(review.Similarity * 100)}%</strong> the same as {existingLink}.";
         var compare = review.IsIdentical || existing is null || review.OcrText is null ? "" : $"""
             <details class='compare'><summary>Compare the text</summary><div class='compare-grid'>
-              <div><p class='eyebrow'>NEW SCAN</p><pre class='ocr-text'>{H(Trim(review.OcrText, 2500))}</pre></div>
-              <div><p class='eyebrow'>ALREADY IN LIBRARY</p><pre class='ocr-text'>{H(Trim(existing.OcrText, 2500))}</pre></div>
+              <p class='eyebrow'>NEW SCAN</p><p class='eyebrow'>ALREADY IN LIBRARY</p>
+              <div class='compare-lines'>{CompareTextLines(review.OcrText, existing.OcrText)}</div>
             </div></details>
             """;
         return $"""
@@ -754,6 +815,85 @@ static string ReviewsPage(IReadOnlyList<(ScanReview Review, DocumentRecord? Exis
         <p>These scans look like documents already in your library, so they were not processed. Discarding a scan moves it to <code>{H(duplicatesFolder)}</code>; nothing is deleted.</p></div>
         <div class='review-list'>{cards}</div>
         """;
+}
+
+static string CompareTextLines(string newText, string libraryText)
+{
+    static string[] GetLines(string text) => Trim(text, 2500)
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.Trim())
+        .Where(line => line.Length > 0)
+        .ToArray();
+    static string NormalizeLine(string line) => string.Concat(line.Where(character => !char.IsWhiteSpace(character)));
+
+    var newLines = GetLines(newText);
+    var libraryLines = GetLines(libraryText);
+    var normalizedNewLines = newLines.Select(NormalizeLine).ToArray();
+    var normalizedLibraryLines = libraryLines.Select(NormalizeLine).ToArray();
+    var common = new int[newLines.Length + 1, libraryLines.Length + 1];
+    for (var i = newLines.Length - 1; i >= 0; i--)
+    {
+        for (var j = libraryLines.Length - 1; j >= 0; j--)
+        {
+            common[i, j] = string.Equals(normalizedNewLines[i], normalizedLibraryLines[j], StringComparison.Ordinal)
+                ? common[i + 1, j + 1] + 1
+                : Math.Max(common[i + 1, j], common[i, j + 1]);
+        }
+    }
+
+    var html = new StringBuilder();
+    var changedNew = new List<string>();
+    var changedLibrary = new List<string>();
+    void AppendRow(string? newLine, string? libraryLine, bool mismatch)
+    {
+        html.Append("<div class='compare-row'>");
+        AppendCell(newLine, "NEW SCAN", mismatch);
+        AppendCell(libraryLine, "ALREADY IN LIBRARY", mismatch);
+        html.Append("</div>");
+    }
+
+    void AppendCell(string? line, string label, bool mismatch)
+    {
+        html.Append("<div class='compare-line");
+        if (mismatch) html.Append(" mismatch");
+        if (line is null) html.Append(" missing");
+        html.Append("' data-label='").Append(label).Append('\'');
+        if (line is null) html.Append(" aria-hidden='true'></div>");
+        else html.Append('>').Append(H(line)).Append("</div>");
+    }
+
+    void FlushChanges()
+    {
+        var rows = Math.Max(changedNew.Count, changedLibrary.Count);
+        for (var row = 0; row < rows; row++)
+            AppendRow(row < changedNew.Count ? changedNew[row] : null,
+                row < changedLibrary.Count ? changedLibrary[row] : null, mismatch: true);
+        changedNew.Clear();
+        changedLibrary.Clear();
+    }
+
+    var newIndex = 0;
+    var libraryIndex = 0;
+    while (newIndex < newLines.Length || libraryIndex < libraryLines.Length)
+    {
+        if (newIndex < newLines.Length && libraryIndex < libraryLines.Length &&
+            string.Equals(normalizedNewLines[newIndex], normalizedLibraryLines[libraryIndex], StringComparison.Ordinal))
+        {
+            FlushChanges();
+            AppendRow(newLines[newIndex++], libraryLines[libraryIndex++], mismatch: false);
+        }
+        else if (newIndex < newLines.Length &&
+            (libraryIndex == libraryLines.Length || common[newIndex + 1, libraryIndex] >= common[newIndex, libraryIndex + 1]))
+        {
+            changedNew.Add(newLines[newIndex++]);
+        }
+        else
+        {
+            changedLibrary.Add(libraryLines[libraryIndex++]);
+        }
+    }
+    FlushChanges();
+    return html.ToString();
 }
 
 static string DetailPage(DocumentRecord d, string? message, IReadOnlyDictionary<string, string> colours)
@@ -969,18 +1109,20 @@ static string ProcessingPage(string currentModel) => """
 static string PageShell(string title, string body, bool signedIn = true) => """
     <!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#071120'>
     <title>__TITLE__ · Document Tagger</title><style>
-    :root{color-scheme:dark;--bg:#090d18;--panel:#12192a;--panel-2:#182135;--line:#2a3550;--text:#f0f4ff;--muted:#99a7c2;--accent:#7c8cff;--accent-2:#5eead4;--danger:#ff9ca8}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 12% -10%,#233a68 0,transparent 31rem),radial-gradient(ellipse at 85% 0,#203953 0,transparent 30rem),var(--bg);color:var(--text);font:15px/1.55 Inter,Segoe UI,Arial,sans-serif}body:before{content:'';position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(to bottom,black,transparent 70%)}main{max-width:1240px;margin:auto;padding:52px 28px 80px;position:relative}.site-mark{display:flex;gap:11px;align-items:center;color:#d9e1fa;font-weight:700;text-decoration:none;letter-spacing:-.02em;margin-bottom:45px}.site-mark:before{content:'✦';display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#0b1020;box-shadow:0 7px 25px rgba(94,234,212,.23)}h1{font-size:clamp(2.25rem,5vw,4.1rem);letter-spacing:-.055em;line-height:1.02;margin:.12em 0 .2em}h2{font-size:1.08rem;margin:0 0 20px}.hero,.detail-head{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:34px}.eyebrow{letter-spacing:.14em;font-weight:700;color:var(--accent-2);font-size:.7rem;margin:0}.hero p:not(.eyebrow),.detail-head>div>p,.edit-heading p:not(.eyebrow){color:var(--muted);margin:8px 0;max-width:580px}.primary,.button,button{border:1px solid var(--line);background:rgba(255,255,255,.03);padding:10px 15px;border-radius:9px;color:var(--text);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;display:inline-block;transition:.18s ease}.primary{border-color:transparent;background:linear-gradient(135deg,var(--accent),#6672e9);box-shadow:0 10px 30px rgba(92,109,239,.22)}.primary:hover{filter:brightness(1.1);transform:translateY(-1px)}.button:hover,button:not(.primary):hover{border-color:#65759a;background:rgba(255,255,255,.07)}.filters{display:flex;flex-wrap:wrap;gap:10px;padding:13px;background:rgba(18,25,42,.8);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:13px;box-shadow:0 16px 40px rgba(0,0,0,.17)}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 11px;font:inherit;color:var(--text);background:#0c1322;outline:none;transition:border .18s,box-shadow .18s}input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,140,255,.17)}select{width:auto;min-width:145px}input[name=name],input[name=content]{flex:1;min-width:210px}.filters input{width:auto;min-width:135px}.clear,.back{color:var(--accent-2);padding:10px;text-decoration:none}.count{color:var(--muted);font-size:.87rem;margin:18px 2px}.table-wrap{overflow:auto;background:rgba(18,25,42,.8);border:1px solid var(--line);border-radius:13px;box-shadow:0 18px 46px rgba(0,0,0,.17)}table{width:100%;border-collapse:collapse;min-width:900px}th,td{padding:17px;text-align:left;border-bottom:1px solid rgba(42,53,80,.8);vertical-align:top}tbody tr:last-child td{border-bottom:0}tbody tr{transition:background .18s}tbody tr:hover{background:rgba(124,140,255,.06)}th{color:var(--muted);font-size:.69rem;letter-spacing:.1em;text-transform:uppercase;font-weight:700}td a{color:#dce3ff;font-weight:700;text-decoration:none}td a:hover{color:var(--accent-2)}small{display:block;color:var(--muted);margin-top:3px}.tag{display:inline-block;background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.17);border-radius:99px;padding:2px 8px;margin:1px;color:#a4f5e7;font-size:.79rem}.empty{text-align:center;color:var(--muted);padding:48px}.notice{background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.25);padding:12px 15px;margin:0 0 22px;border-radius:9px;color:#baf9ee}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.actions form{margin:0}.metadata,section,.processing,.edit-form{background:rgba(18,25,42,.82);backdrop-filter:blur(16px);border:1px solid var(--line);padding:26px;border-radius:13px;margin:22px 0;box-shadow:0 18px 46px rgba(0,0,0,.14)}.processing{max-width:650px;margin:80px auto}.chat-panel{display:flex;flex-direction:column;gap:16px}.chat-help{color:var(--muted);margin:0}.chat-form{display:flex;gap:10px;align-items:end}.chat-form textarea{min-height:58px;resize:vertical}.chat-form button{white-space:nowrap}.chat-answer{min-height:48px;padding:14px 16px;color:#dbe3f7;background:rgba(7,12,25,.62);border:1px solid var(--line);border-radius:9px;white-space:pre-wrap}.document-chat{padding:7px 10px;font-size:.82rem;white-space:nowrap}.document-chat-dialog{width:min(620px,calc(100% - 28px));padding:28px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.48)}.document-chat-dialog::backdrop{background:rgba(2,5,12,.76);backdrop-filter:blur(4px)}.document-chat-dialog h2{margin:6px 0 20px}.document-chat-dialog textarea{margin:0 0 12px;resize:vertical}.dialog-close{float:right}.dialog-close button{font-size:1.4rem;line-height:1;padding:4px 10px}.progress{height:10px;background:#0a1020;border-radius:99px;overflow:hidden;margin:24px 0 10px}.progress>div{height:100%;width:4%;background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:99px;transition:width .35s ease}.hint{color:var(--muted)}.hidden{display:none}dl{display:grid;grid-template-columns:170px 1fr;gap:13px 20px;margin:0}dt{font-weight:650;color:var(--muted)}dd{margin:0}pre{white-space:pre-wrap;font:13px/1.65 ui-monospace,Consolas,monospace;margin:0;color:#cbd5ed}.edit-heading{margin-bottom:28px}.edit-form{max-width:920px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 18px;margin-bottom:18px}.edit-form label{display:block;font-size:.84rem;font-weight:700;color:#ccd5ec;margin:17px 0}.form-grid label{margin:0}.edit-form label span{font-size:.75rem;color:var(--muted);font-weight:500;margin-left:4px}.edit-form input,.edit-form textarea{display:block;margin-top:7px}.edit-form textarea{resize:vertical}.ocr-input{font:13px/1.5 ui-monospace,Consolas,monospace;color:#cbd5ed}@media(max-width:650px){main{padding:30px 16px}.site-mark{margin-bottom:28px}.hero,.detail-head{display:block}.hero form{margin-top:20px}.form-grid{grid-template-columns:1fr}dl{grid-template-columns:1fr;gap:4px}dd{margin-bottom:13px}.filters input,.filters select{width:100%;flex:auto}}
+    :root{color-scheme:dark;--bg:#090d18;--panel:#12192a;--panel-2:#182135;--line:#2a3550;--text:#f0f4ff;--muted:#99a7c2;--accent:#7c8cff;--accent-2:#5eead4;--danger:#ff9ca8}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 12% -10%,#233a68 0,transparent 31rem),radial-gradient(ellipse at 85% 0,#203953 0,transparent 30rem),var(--bg);color:var(--text);font:15px/1.55 Inter,Segoe UI,Arial,sans-serif}body:before{content:'';position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(to bottom,black,transparent 70%)}main{max-width:1240px;margin:auto;padding:52px 28px 80px;position:relative}.site-mark{display:flex;gap:11px;align-items:center;color:#d9e1fa;font-weight:700;text-decoration:none;letter-spacing:-.02em;margin-bottom:45px}.site-mark:before{content:'✦';display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#0b1020;box-shadow:0 7px 25px rgba(94,234,212,.23)}h1{font-size:clamp(2.25rem,5vw,4.1rem);letter-spacing:-.055em;line-height:1.02;margin:.12em 0 .2em}h2{font-size:1.08rem;margin:0 0 20px}.hero,.detail-head{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:34px}.eyebrow{letter-spacing:.14em;font-weight:700;color:var(--accent-2);font-size:.7rem;margin:0}.hero p:not(.eyebrow),.detail-head>div>p,.edit-heading p:not(.eyebrow){color:var(--muted);margin:8px 0;max-width:580px}.primary,.button,button{border:1px solid var(--line);background:rgba(255,255,255,.03);padding:10px 15px;border-radius:9px;color:var(--text);font:inherit;font-weight:650;cursor:pointer;text-decoration:none;display:inline-block;transition:.18s ease}.primary{border-color:transparent;background:linear-gradient(135deg,var(--accent),#6672e9);box-shadow:0 10px 30px rgba(92,109,239,.22)}.primary:hover{filter:brightness(1.1);transform:translateY(-1px)}.button:hover,button:not(.primary):hover{border-color:#65759a;background:rgba(255,255,255,.07)}.filters{display:flex;flex-wrap:wrap;gap:10px;padding:13px;background:rgba(18,25,42,.8);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:13px;box-shadow:0 16px 40px rgba(0,0,0,.17)}input,select,textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 11px;font:inherit;color:var(--text);background:#0c1322;outline:none;transition:border .18s,box-shadow .18s}input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,140,255,.17)}select{width:auto;min-width:145px}input[name=name],input[name=content]{flex:1;min-width:210px}.filters input{width:auto;min-width:135px}.clear,.back{color:var(--accent-2);padding:10px;text-decoration:none}.count{color:var(--muted);font-size:.87rem;margin:18px 2px}.table-wrap{overflow:auto;background:rgba(18,25,42,.8);border:1px solid var(--line);border-radius:13px;box-shadow:0 18px 46px rgba(0,0,0,.17)}table{width:100%;border-collapse:collapse;min-width:900px}th,td{padding:17px;text-align:left;border-bottom:1px solid rgba(42,53,80,.8);vertical-align:top}tbody tr:last-child td{border-bottom:0}tbody tr{transition:background .18s}tbody tr:hover{background:rgba(124,140,255,.06)}th{color:var(--muted);font-size:.69rem;letter-spacing:.1em;text-transform:uppercase;font-weight:700}td a{color:#dce3ff;font-weight:700;text-decoration:none}td a:hover{color:var(--accent-2)}small{display:block;color:var(--muted);margin-top:3px}.tag{display:inline-block;background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.17);border-radius:99px;padding:2px 8px;margin:1px;color:#a4f5e7;font-size:.79rem}.empty{text-align:center;color:var(--muted);padding:48px}.notice{background:rgba(94,234,212,.1);border:1px solid rgba(94,234,212,.25);padding:12px 15px;margin:0 0 22px;border-radius:9px;color:#baf9ee}.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.actions form{margin:0}.metadata,section,.processing,.edit-form{background:rgba(18,25,42,.82);backdrop-filter:blur(16px);border:1px solid var(--line);padding:26px;border-radius:13px;margin:22px 0;box-shadow:0 18px 46px rgba(0,0,0,.14)}.processing{max-width:650px;margin:80px auto}    .chat-panel-content{display:flex;flex-direction:column;gap:16px}.chat-help{color:var(--muted);margin:0}.chat-form{display:flex;gap:10px;align-items:end}.chat-form textarea{min-height:58px;resize:vertical}.chat-form button{white-space:nowrap}.chat-answer{min-height:48px;padding:14px 16px;color:#dbe3f7;background:rgba(7,12,25,.62);border:1px solid var(--line);border-radius:9px;white-space:pre-wrap}.document-chat{padding:7px 10px;font-size:.82rem;white-space:nowrap}.document-chat-dialog{width:min(620px,calc(100% - 28px));padding:28px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.48)}.document-chat-dialog::backdrop{background:rgba(2,5,12,.76);backdrop-filter:blur(4px)}.document-chat-dialog h2{margin:6px 0 20px}.document-chat-dialog textarea{margin:0 0 12px;resize:vertical}.dialog-close{float:right}.dialog-close button{font-size:1.4rem;line-height:1;padding:4px 10px}.progress{height:10px;background:#0a1020;border-radius:99px;overflow:hidden;margin:24px 0 10px}.progress>div{height:100%;width:4%;background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:99px;transition:width .35s ease}.hint{color:var(--muted)}.hidden{display:none}dl{display:grid;grid-template-columns:170px 1fr;gap:13px 20px;margin:0}dt{font-weight:650;color:var(--muted)}dd{margin:0}pre{white-space:pre-wrap;font:13px/1.65 ui-monospace,Consolas,monospace;margin:0;color:#cbd5ed}.edit-heading{margin-bottom:28px}.edit-form{max-width:920px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 18px;margin-bottom:18px}.edit-form label{display:block;font-size:.84rem;font-weight:700;color:#ccd5ec;margin:17px 0}.form-grid label{margin:0}.edit-form label span{font-size:.75rem;color:var(--muted);font-weight:500;margin-left:4px}.edit-form input,.edit-form textarea{display:block;margin-top:7px}.edit-form textarea{resize:vertical}.ocr-input{font:13px/1.5 ui-monospace,Consolas,monospace;color:#cbd5ed}@media(max-width:650px){main{padding:30px 16px}.site-mark{margin-bottom:28px}.hero,.detail-head{display:block}.hero form{margin-top:20px}.form-grid{grid-template-columns:1fr}dl{grid-template-columns:1fr;gap:4px}dd{margin-bottom:13px}.filters input,.filters select{width:100%;flex:auto}}
     .progress.indeterminate>div{width:35%;animation:progress-slide 1.4s ease-in-out infinite}@keyframes progress-slide{from{transform:translateX(-110%)}to{transform:translateX(310%)}}
     .model-settings{border-top:1px solid var(--line);margin-top:30px;padding-top:20px}.model-settings>p:not(.eyebrow){margin:8px 0}.model-picker{display:grid;gap:7px;margin-top:18px}.model-picker label{font-size:.84rem;color:var(--muted)}.model-picker>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px}.model-picker select{width:100%;min-width:0}
     .site-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:45px}.site-mark{margin-bottom:0}.sign-in{max-width:460px;margin:8vh auto}.sign-in h1{font-size:clamp(2.25rem,5vw,3.2rem)}.sign-in>p:not(.eyebrow){margin:8px 0 24px}.sign-in label{display:block;margin:18px 0;font-weight:650}.sign-in input{display:block;margin-top:7px}.sign-in .primary{width:100%;margin-top:5px}@media(max-width:650px){.site-header{margin-bottom:28px}}
     :root{--bg:#071120;--panel:rgba(15,30,58,.64);--panel-2:rgba(25,48,86,.58);--line:rgba(156,190,245,.2);--text:#eef4ff;--muted:#a6b8d7;--accent:#4f8cff;--accent-2:#8bc5ff}
     body{background:radial-gradient(ellipse at 12% -10%,rgba(53,111,225,.42) 0,transparent 34rem),radial-gradient(ellipse at 88% 2%,rgba(37,87,166,.38) 0,transparent 32rem),linear-gradient(145deg,#071120,#0a1630 48%,#07101f);background-attachment:fixed}
-    main{max-width:1320px;padding-top:36px}
-    .site-header{position:relative;padding:13px 17px;border:1px solid rgba(175,204,255,.16);border-radius:16px;background:rgba(9,22,47,.48);backdrop-filter:blur(22px) saturate(145%);box-shadow:0 14px 42px rgba(0,7,24,.25),inset 0 1px rgba(255,255,255,.06)}
+    main{max-width:1680px;padding:18px 32px 48px}
+    .site-header{position:sticky;top:0;z-index:10;display:flex;justify-content:space-between;align-items:center;width:100%;margin:0;padding:10px clamp(16px,3vw,42px);border:0;border-bottom:1px solid rgba(175,204,255,.16);border-radius:0;background:rgba(7,17,36,.88);backdrop-filter:blur(22px) saturate(145%);box-shadow:0 10px 28px rgba(0,7,24,.2),inset 0 1px rgba(255,255,255,.04)}
+    .site-header form{margin:0}.site-header .button{padding:8px 14px}
     .site-mark:before{box-shadow:0 7px 25px rgba(75,139,255,.34)}
     .eyebrow{color:#8fc7ff}
-    .hero{align-items:center;padding:8px 0 24px;border-bottom:1px solid rgba(156,190,245,.14)}
+    .hero{align-items:center;padding:0 0 8px;margin-bottom:0;border-bottom:0}
     .primary{background:linear-gradient(135deg,#4f8cff,#4269e8);box-shadow:0 10px 30px rgba(54,113,255,.25)}
+    .process-button{background:linear-gradient(135deg,#28b978,#168456);box-shadow:0 9px 24px rgba(27,156,102,.22)}.process-button:hover{background:linear-gradient(135deg,#32ca88,#1b9b66)}
     .button:hover,button:not(.primary):hover{border-color:rgba(139,190,255,.65);background:rgba(95,150,240,.12)}
     .chat-panel,.metadata,section,.processing,.edit-form,.filters,.table-wrap,.document-chat-dialog,.sign-in{background:linear-gradient(135deg,rgba(49,83,139,.24),rgba(12,27,54,.68));border:1px solid rgba(171,201,250,.2);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 22px 60px rgba(0,5,20,.29),inset 0 1px rgba(255,255,255,.07)}
     .chat-panel,.metadata,.processing,.edit-form,.sign-in{border-radius:20px}
@@ -999,7 +1141,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .document-chat-dialog::backdrop{background:rgba(2,8,22,.72);backdrop-filter:blur(8px)}
     .progress{background:rgba(4,14,32,.7)}
     .progress>div{background:linear-gradient(90deg,#4f8cff,#9bd1ff)}
-    @media(max-width:650px){main{padding-top:24px}.site-header{padding:10px 12px;margin-bottom:24px}.hero{padding-bottom:18px}}
+    @media(max-width:650px){main{padding-top:14px}.site-header{padding:9px 14px}.hero{padding-bottom:4px}}
     .chat-thread{display:grid;gap:16px;align-content:start}
     .chat-turn{display:grid;gap:8px}.chat-question{margin:0;justify-self:end;max-width:85%;padding:9px 14px;border-radius:14px 14px 4px 14px;background:rgba(79,140,255,.18);border:1px solid rgba(139,190,255,.28);color:#e3efff;white-space:pre-wrap}
     .chat-answer.rendered{white-space:normal}.chat-answer.rendered>:first-child{margin-top:0}.chat-answer.rendered>:last-child{margin-bottom:0}.chat-answer p{margin:0 0 10px}.chat-answer ul,.chat-answer ol{margin:0 0 10px;padding-left:22px}.chat-answer li{margin:3px 0}.chat-answer h4{margin:12px 0 6px;font-size:.95rem}
@@ -1009,7 +1151,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .review-notice{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:rgba(255,190,90,.1);border-color:rgba(255,200,120,.35);color:#ffe2b8}.review-notice .button{padding:7px 13px}
     .review-list{display:grid;gap:18px}.review-card{margin:0}.review-card h2{margin:4px 0 8px;overflow-wrap:anywhere}.review-card .eyebrow{color:#ffcf8a}
     .review-verdict{margin:0 0 10px}.review-verdict a,.review-links a{color:#9ed0ff}.review-links{display:flex;flex-wrap:wrap;gap:8px 18px;margin:0 0 14px;font-size:.9rem}
-    .compare{margin:0 0 16px}.compare>summary{cursor:pointer;color:var(--muted);font-weight:650;font-size:.9rem;margin-bottom:10px}.compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compare-grid .eyebrow{margin-bottom:6px}.compare-grid .ocr-text{max-height:340px;font-size:12px}
+    .compare{margin:0 0 16px}.compare>summary{cursor:pointer;color:var(--muted);font-weight:650;font-size:.9rem;margin-bottom:10px}.compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;max-height:340px;overflow:auto;padding:0 8px 8px;border:1px solid rgba(156,190,245,.16);border-radius:10px;background:rgba(6,17,37,.34)}.compare-grid>.eyebrow{position:sticky;top:0;z-index:1;margin:0;padding:9px 10px 6px;background:rgba(13,29,59,.96)}.compare-lines{grid-column:1/-1;display:grid;gap:3px;min-width:0}.compare-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;min-width:0}.compare-line{min-width:0;margin:0;padding:7px 10px;overflow-wrap:anywhere;white-space:pre-wrap;border-radius:6px;background:rgba(6,17,37,.32);color:#cbd5ed;font:12px/1.6 ui-monospace,Consolas,monospace}.compare-line.mismatch{background:rgba(255,120,140,.16);box-shadow:inset 3px 0 rgba(255,156,168,.85);color:#ffe0e4}.compare-line.missing{background:rgba(255,120,140,.07);outline:1px dashed rgba(255,156,168,.35)}
     .review-actions{display:flex;gap:10px;flex-wrap:wrap}.review-actions form{margin:0}.review-found{margin:12px 0 0;font-size:.8rem}.review-empty{text-align:center;color:var(--muted)}
     .scan-stage{display:grid;grid-template-columns:auto minmax(0,1fr);gap:28px;align-items:center;margin:26px 0 24px}
     .doc-anim{position:relative;width:96px;height:124px;margin:4px 8px 28px 4px}
@@ -1053,12 +1195,13 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     @media(prefers-reduced-motion:reduce){.doc-anim,.doc-anim *,.scan-steps li:before,.progress>div{animation:none!important}.doc-anim[data-step=ocr] .doc-beam{opacity:1;top:50%}}
     @media(max-width:650px){.scan-stage{grid-template-columns:1fr;justify-items:center;text-align:center;gap:10px}.scan-steps{justify-content:center}}
     code{font:13px ui-monospace,Consolas,monospace;background:rgba(6,17,37,.6);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
-    @media(max-width:650px){.compare-grid{grid-template-columns:1fr}.review-actions{display:grid;grid-template-columns:1fr}.review-actions button{width:100%}.review-notice .button{width:100%;text-align:center}}
+    @media(max-width:650px){.compare-grid{grid-template-columns:1fr;max-height:420px}.compare-grid>.eyebrow{display:none}.compare-lines{grid-column:1}.compare-row{grid-template-columns:1fr;gap:4px;padding-bottom:8px;border-bottom:1px solid rgba(156,190,245,.12)}.compare-line:before{content:attr(data-label);display:block;margin-bottom:3px;color:var(--muted);font-size:.62rem;font-weight:700;letter-spacing:.1em}.review-actions{display:grid;grid-template-columns:1fr}.review-actions button{width:100%}.review-notice .button{width:100%;text-align:center}}
     /* Layout for desktop and mobile */
     body{background-attachment:scroll;background-color:#07101f}html{background:#07101f}
     .visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
     :root{--input-size:15px}input,select,textarea,.edit-form input,.edit-form textarea{font-weight:400;font-size:var(--input-size)}
     :focus-visible{outline:2px solid #8bc5ff;outline-offset:2px}input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none}
+    .home-tools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0 10px}.home-tools form{margin:0}.panel-toggle{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-width:118px;padding:10px 16px;font-size:1rem}.panel-toggle-icon{width:19px;height:19px;flex:none}.panel-toggle:after{content:'';width:8px;height:8px;margin-left:4px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg);transition:transform .18s}.panel-toggle[aria-expanded=true]:after{transform:rotate(225deg)}.filter-count{min-width:20px;padding:1px 6px;border-radius:99px;background:rgba(255,255,255,.2);font-size:.76rem;text-align:center}
     .chat-intro h2{margin:4px 0 6px}
     .chat-thread{max-height:min(62vh,680px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
     .chat-panel .chat-thread:has(>.chat-placeholder){display:none}
@@ -1067,22 +1210,23 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .dialog-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px}.dialog-head h2{margin:4px 0 0;overflow-wrap:anywhere}.dialog-close{float:none;margin:0}
     .document-chat-dialog[open]{display:flex;flex-direction:column;max-height:min(88vh,880px)}
     .document-chat-dialog .chat-thread{flex:1 1 auto;max-height:none;min-height:60px;margin-bottom:14px}.document-chat-dialog .chat-form{flex-shrink:0}
-    .filter-panel{margin:22px 0 0;border:1px solid rgba(171,201,250,.2);border-radius:16px;background:rgba(13,28,57,.48);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 22px 60px rgba(0,5,20,.2)}
-    .filter-panel>summary{list-style:none;cursor:pointer;padding:14px 18px;font-weight:650;display:flex;align-items:center;gap:10px;border-radius:16px}.filter-panel>summary::-webkit-details-marker{display:none}
-    .filter-panel>summary:after{content:'';margin-left:auto;width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg) translateY(-3px);transition:transform .18s}.filter-panel[open]>summary:after{transform:rotate(225deg) translateY(-1px)}
-    .filter-count{font-size:.75rem;font-weight:650;color:#c4e0ff;background:rgba(79,140,255,.18);border:1px solid rgba(139,190,255,.3);border-radius:99px;padding:1px 8px}
-    .filter-panel .filters{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:2px 16px 16px;border:0;border-radius:0;background:none;box-shadow:none;backdrop-filter:none}
+    .collapsible-panel>summary{display:none}
+    .chat-panel{display:block;padding:0;margin:0 0 14px}
+    .chat-panel-content{padding:20px}
+    .filter-panel{margin:0 0 14px;padding:0;border:1px solid rgba(171,201,250,.2);border-radius:16px;background:rgba(13,28,57,.48);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 22px 60px rgba(0,5,20,.2)}
+    .filter-panel .filters{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0;padding:14px;border:0;border-radius:inherit;background:none;box-shadow:none;backdrop-filter:none}
     .filters label{display:grid;gap:5px;font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-width:0}
     .filter-panel .filters input,.filter-panel .filters select{width:100%;min-width:0;flex:none;text-transform:none;letter-spacing:normal;font-size:var(--input-size);font-weight:400}
     .filter-wide,.filter-actions{grid-column:1/-1}.filter-actions{display:flex;gap:6px;align-items:center}.filter-actions button{min-width:110px}
     .col-date{white-space:nowrap}.col-name{min-width:190px}.col-people{min-width:110px}.col-summary{min-width:220px;color:#cfdaef}.col-ai{text-align:right;white-space:nowrap}.col-name a{overflow-wrap:anywhere}
+    .document-actions{display:flex;flex-direction:column;gap:7px;width:120px;margin-left:auto}.document-actions form{margin:0}.document-actions button{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;padding:7px 8px;font-size:.78rem;white-space:nowrap}.action-icon{width:15px;height:15px;flex:none}
     .section-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}.section-head h2{margin:0 0 14px}.section-head span{color:var(--muted);font-size:.8rem}
     .ocr-text{max-height:min(70vh,760px);overflow:auto;padding:14px 16px;border:1px solid rgba(156,190,245,.16);border-radius:10px;background:rgba(6,17,37,.48)}
-    @media(min-width:801px){.filter-panel>summary{display:none}.filter-panel .filters{grid-template-columns:minmax(0,1.5fr) minmax(0,1.5fr) minmax(0,1fr) minmax(0,.9fr) minmax(0,.9fr) auto;align-items:end;padding:14px}.filter-wide,.filter-actions{grid-column:auto}}
+    @media(min-width:801px){.filter-panel .filters{grid-template-columns:minmax(0,1.5fr) minmax(0,1.5fr) minmax(0,1fr) minmax(0,.9fr) minmax(0,.9fr) auto;align-items:end;padding:18px}.filter-wide,.filter-actions{grid-column:auto}}
     @media(max-width:800px){
       .table-wrap{overflow:visible;background:none;border:0;box-shadow:none;backdrop-filter:none;border-radius:0}
       table{min-width:0}thead{display:none}table,tbody,td{display:block}tbody{display:grid;gap:12px}
-      tbody tr{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:'name name ai' 'date from to' 'tags tags tags' 'summary summary summary';gap:12px;padding:16px;border:1px solid rgba(171,201,250,.2);border-radius:16px;background:linear-gradient(135deg,rgba(49,83,139,.24),rgba(12,27,54,.68));box-shadow:0 14px 40px rgba(0,5,20,.22)}
+      tbody tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 120px;grid-template-areas:'name name ai' 'date from to' 'tags tags tags' 'summary summary summary';gap:12px;padding:16px;border:1px solid rgba(171,201,250,.2);border-radius:16px;background:linear-gradient(135deg,rgba(49,83,139,.24),rgba(12,27,54,.68));box-shadow:0 14px 40px rgba(0,5,20,.22)}
       tbody tr:hover{background:linear-gradient(135deg,rgba(49,83,139,.32),rgba(12,27,54,.72))}
       td{padding:0;border:0;min-width:0;overflow-wrap:anywhere}.col-name{grid-area:name;min-width:0;font-size:1.02rem}.col-date{grid-area:date}.col-from{grid-area:from}.col-to{grid-area:to}.col-tags{grid-area:tags}.col-summary{grid-area:summary;min-width:0}.col-ai{grid-area:ai;align-self:start}.col-people{min-width:0}
       td[data-label]{font-size:.88rem}td[data-label]:before{content:attr(data-label);display:block;font-size:.64rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
@@ -1092,7 +1236,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
       main{padding:16px 14px 48px}.site-header{margin-bottom:22px}
       h1{font-size:clamp(1.9rem,9vw,2.5rem);overflow-wrap:anywhere}
       .hero{padding-bottom:18px;margin-bottom:22px}.hero form,.hero form button{width:100%}.hero form button{margin-top:4px}
-      .chat-panel,.metadata,section,.processing,.edit-form,.sign-in{padding:18px;border-radius:18px}.processing{margin:24px auto}
+      .chat-panel,.metadata,section,.processing,.edit-form,.sign-in{padding:18px;border-radius:18px}.chat-panel{padding:0}.chat-panel-content{padding:18px}.processing{margin:24px auto}
       .chat-form{flex-direction:column;align-items:stretch}.chat-buttons .primary{flex:1}
       .chat-question{max-width:92%}
       .filter-panel .filters{grid-template-columns:1fr}
@@ -1108,7 +1252,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     a.tag{text-decoration:none;font-weight:500;transition:filter .15s}a.tag:hover{filter:brightness(1.25)}
     .tag.category{font-weight:700}.tag.category:before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor;margin:0 5px 1px 0;vertical-align:middle}
     .col-tags{min-width:200px}.doc-row td.col-name{box-shadow:inset 3px 0 0 var(--accent,transparent)}
-    .view-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:18px 0 0}
+    .view-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 0}
     .segmented{display:inline-flex;padding:3px;border-radius:11px;background:rgba(6,17,37,.55);border:1px solid rgba(156,190,245,.18)}
     .segmented a{padding:7px 14px;border-radius:8px;color:var(--muted);text-decoration:none;font-weight:650;font-size:.88rem;white-space:nowrap}
     .segmented a.active{background:rgba(79,140,255,.25);color:#e3efff;box-shadow:inset 0 0 0 1px rgba(139,190,255,.4)}.segmented a:not(.active):hover{color:var(--text)}
@@ -1153,7 +1297,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .label-search{display:flex;gap:8px}.label-search input{width:min(260px,52vw)}
     @media(pointer:coarse){.swatch span{width:28px;height:28px}.swatches{gap:7px}}
     __PALETTE__
-    </style></head><body><main><header class='site-header'><a class='site-mark' href='/'>Document Tagger</a>__ACCOUNT__</header>__BODY__</main></body></html>
+    </style></head><body><header class='site-header'><a class='site-mark' href='/'>Document Tagger</a>__ACCOUNT__</header><main>__BODY__</main></body></html>
     """.Replace("__TITLE__", H(title))
     .Replace("__ACCOUNT__", signedIn ? "<form method='post' action='/sign-out'><button class='button' type='submit'>Sign out</button></form>" : "")
     .Replace("__PALETTE__", LabelColours.Css)
@@ -1500,12 +1644,19 @@ sealed class DocumentProcessor(DocumentStore store, OcrService ocr, OllamaClient
 
     private static string Plural(int count, string noun) => $"{count} {noun}{(count == 1 ? "" : "s")}";
 
-    public async Task<string> ReprocessAsync(long id)
+    public async Task<ProcessingResult> ReprocessAsync(long id, Action<ScanProgress>? progress = null)
     {
         var existing = store.Get(id);
-        if (existing is null) return "Document not found.";
-        try { await ProcessFileAsync(existing.SourcePath, id, null); return "Document reprocessed."; }
-        catch (Exception ex) { return $"Reprocessing failed: {ex.Message}"; }
+        if (existing is null) return new ProcessingResult($"Document {id}", "failed", "Document not found.");
+        try
+        {
+            var reprocessedId = await ProcessFileAsync(existing.SourcePath, id, progress);
+            return new ProcessingResult(existing.OriginalFileName, "saved", "Document reprocessed and indexed.", reprocessedId);
+        }
+        catch (Exception ex)
+        {
+            return new ProcessingResult(existing.OriginalFileName, "failed", $"Reprocessing failed: {ex.Message}");
+        }
     }
 
     private async Task<long> ProcessFileAsync(string sourcePath, long? existingId, Action<ScanProgress>? progress, string? ocrText = null)
