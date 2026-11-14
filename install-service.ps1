@@ -56,6 +56,7 @@ try {
     Start-Service -Name $serviceName
     (Get-Service -Name $serviceName).WaitForStatus(
         [System.ServiceProcess.ServiceControllerStatus]::Running,
+        
         [TimeSpan]::FromSeconds(30))
 
     $deadline = (Get-Date).AddSeconds(30)

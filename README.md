@@ -7,6 +7,7 @@ The app keeps a local SQLite search index and also writes a readable `.metadata.
 ## Features
 
 - Finds new PDFs in a configured scans folder
+- Uploads a PDF from the home page and starts processing it immediately (maximum 20 MB)
 - Renders PDF pages to images with `pdftoppm`
 - Extracts OCR text with Tesseract
 - Uses local Ollama to infer metadata such as title, sender/addressee, date, category, tags, keywords, and summary
@@ -127,7 +128,7 @@ To apply app or dependency path changes to an existing service, run the installe
 
 ## Workflow
 
-From the home page, click **Process scans** to process every new PDF in the scans folder. The original file is left untouched.
+From the home page, click **Process scans** to process every new PDF in the scans folder, or choose a PDF and click **Upload and process** to add it to the scans folder and start processing immediately. Uploads are limited to 20 MB and must be PDFs. The original file is left untouched.
 
 The processing page shows the file being worked on, its current step (render, read text, check for duplicates, analyse, save), and which page is being rendered or read. It also lists the result for each file. Processing continues in the background if you leave the page.
 

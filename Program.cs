@@ -187,6 +187,84 @@ app.MapPost("/process", (ProcessingStatus status, IServiceScopeFactory scopeFact
     return Results.Redirect("/processing");
 });
 
+app.MapPost("/upload", async (HttpRequest request, TaggerSettings settings, ProcessingStatus status, IServiceScopeFactory scopeFactory, CancellationToken cancellationToken) =>
+{
+    const long maxUploadBytes = 20 * 1024 * 1024;
+    if (!request.HasFormContentType)
+        return Results.Redirect($"/?message={Uri.EscapeDataString("Choose a PDF file to upload.")}");
+
+    IFormCollection form;
+    try
+    {
+        form = await request.ReadFormAsync(cancellationToken);
+    }
+    catch (InvalidDataException)
+    {
+        return Results.Redirect($"/?message={Uri.EscapeDataString("The upload form was invalid or exceeded the upload limit.")}");
+    }
+
+    var file = form.Files.GetFile("file");
+    if (file is null || file.Length == 0)
+        return Results.Redirect($"/?message={Uri.EscapeDataString("Choose a non-empty PDF file to upload.")}");
+    if (file.Length > maxUploadBytes)
+        return Results.Redirect($"/?message={Uri.EscapeDataString("The PDF must be 20 MB or smaller.")}");
+
+    var submittedName = Path.GetFileName(file.FileName.Replace('/', '\\'));
+    if (!string.Equals(Path.GetExtension(submittedName), ".pdf", StringComparison.OrdinalIgnoreCase))
+        return Results.Redirect($"/?message={Uri.EscapeDataString("Only PDF files can be uploaded.")}");
+
+    var signature = new byte[5];
+    await using (var input = file.OpenReadStream())
+    {
+        try { await input.ReadExactlyAsync(signature, cancellationToken); }
+        catch (EndOfStreamException)
+        {
+            return Results.Redirect($"/?message={Uri.EscapeDataString("The uploaded file is not a valid PDF.")}");
+        }
+        if (!signature.AsSpan().SequenceEqual("%PDF-"u8))
+            return Results.Redirect($"/?message={Uri.EscapeDataString("The uploaded file is not a valid PDF.")}");
+    }
+
+    var fileName = SafeUploadFileName(submittedName);
+    if (!status.TryBegin())
+        return Results.Redirect($"/?message={Uri.EscapeDataString("Another processing run is already active. Wait for it to finish, then upload the PDF again.")}");
+
+    string? temporaryPath = null;
+    try
+    {
+        Directory.CreateDirectory(settings.ScansDirectory);
+        var destinationPath = AvailableUploadPath(settings.ScansDirectory, fileName);
+        temporaryPath = destinationPath + "." + Guid.NewGuid().ToString("N") + ".uploading";
+        status.Report(new ProcessingUpdate(0, 1, $"Uploading {fileName}…", fileName,
+            new ScanProgress(ScanSteps.Render, "Saving the uploaded PDF…")));
+        await using (var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.Asynchronous))
+            await file.CopyToAsync(output, cancellationToken);
+        File.Move(temporaryPath, destinationPath);
+        temporaryPath = null;
+        StartReservedProcessing(status, scopeFactory);
+        return Results.Redirect("/processing");
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+        status.Fail($"Upload of {fileName} was cancelled.");
+        throw;
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        status.Fail($"Could not upload {fileName}: {ex.Message}");
+        return Results.Redirect($"/?message={Uri.EscapeDataString($"Could not upload {fileName}: {ex.Message}")}");
+    }
+    catch
+    {
+        status.Fail($"Upload of {fileName} failed unexpectedly.");
+        throw;
+    }
+    finally
+    {
+        if (temporaryPath is not null && File.Exists(temporaryPath)) File.Delete(temporaryPath);
+    }
+});
+
 app.MapGet("/reviews", (HttpRequest request, DocumentStore store) =>
 {
     var reviews = store.GetReviews(ScanReview.Pending)
@@ -196,12 +274,11 @@ app.MapGet("/reviews", (HttpRequest request, DocumentStore store) =>
     return Results.Content(PageShell("Possible duplicates", ReviewsPage(reviews, request.Query["message"], Path.Combine(settings.ScansDirectory, DocumentProcessor.DuplicatesFolderName))), "text/html");
 });
 
-app.MapGet("/reviews/{id:long}/file", (long id, DocumentStore store) =>
+app.MapGet("/reviews/{id:long}/file", IResult (long id, DocumentStore store, HttpResponse response) =>
 {
     var review = store.GetReview(id);
-    return review is null || !File.Exists(review.SourcePath)
-        ? Results.NotFound()
-        : Results.File(review.SourcePath, "application/pdf", enableRangeProcessing: true);
+    if (review is null) return TypedResults.NotFound();
+    return StreamPdf(review.SourcePath, response);
 });
 
 app.MapPost("/reviews/{id:long}/discard", (long id, DocumentProcessor processor) =>
@@ -335,12 +412,11 @@ app.MapPost("/documents/{id:long}/edit", async (long id, HttpRequest request, Do
     return Results.Redirect($"/documents/{id}?message={Uri.EscapeDataString("Metadata saved.")}");
 });
 
-app.MapGet("/files/{id:long}", (long id, DocumentStore store) =>
+app.MapGet("/files/{id:long}", IResult (long id, DocumentStore store, HttpResponse response) =>
 {
     var document = store.Get(id);
-    return document is null || !File.Exists(document.FilePath)
-        ? Results.NotFound()
-        : Results.File(document.FilePath, "application/pdf", enableRangeProcessing: true);
+    if (document is null) return TypedResults.NotFound();
+    return StreamPdf(document.FilePath, response);
 });
 
 app.MapGet("/health", async (OllamaClient ollama, DocumentStore store) =>
@@ -468,6 +544,7 @@ static string HomePage(DocumentQuery query, string results, IReadOnlyList<string
           <button id='archive-toggle' class='primary panel-toggle' type='button' aria-expanded='false' aria-controls='archive-panel'><svg class='panel-toggle-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z'/></svg><span>Ask Ollama</span></button>
           <button id='filter-toggle' class='primary panel-toggle' type='button' aria-expanded='{{(activeFilters > 0 ? "true" : "false")}}' aria-controls='filter-panel'><svg class='panel-toggle-icon' viewBox='0 0 24 24' aria-hidden='true' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M4 21v-7'/><path d='M4 10V3'/><path d='M12 21v-9'/><path d='M12 8V3'/><path d='M20 21v-5'/><path d='M20 12V3'/><path d='M2 14h4'/><path d='M10 8h4'/><path d='M18 16h4'/></svg><span>Filter</span>{{filterCount}}</button>
           <form method='post' action='/process'><button class='primary process-button' type='submit'>Process scans</button></form>
+          <form class='upload-form' method='post' action='/upload' enctype='multipart/form-data'><label class='visually-hidden' for='upload-pdf'>Choose a PDF to upload</label><input id='upload-pdf' name='file' type='file' accept='.pdf,application/pdf' required><button class='button' type='submit'>Upload and process</button></form>
         </div>
         <details class='chat-panel collapsible-panel' id='archive-panel' aria-labelledby='archive-toggle'><summary>Ask your archive</summary><div class='chat-panel-content'>
         <div class='chat-intro'><p class='eyebrow'>ASK YOUR ARCHIVE</p><h2>What do you need to find?</h2><p class='chat-help'>Ask about dates, people, payments or renewals, or ask for lists and counts such as “list all bills from 2025”. Follow-up questions use the conversation so far.</p></div>
@@ -733,6 +810,12 @@ static string ChatScript() => """
 static bool StartProcessing(ProcessingStatus status, IServiceScopeFactory scopeFactory)
 {
     if (!status.TryBegin()) return false;
+    StartReservedProcessing(status, scopeFactory);
+    return true;
+}
+
+static void StartReservedProcessing(ProcessingStatus status, IServiceScopeFactory scopeFactory)
+{
     _ = Task.Run(async () =>
     {
         try
@@ -743,7 +826,6 @@ static bool StartProcessing(ProcessingStatus status, IServiceScopeFactory scopeF
         }
         catch (Exception ex) { status.Fail($"Processing stopped: {ex.Message}"); }
     });
-    return true;
 }
 
 static void StartReprocessing(DocumentRecord document, ProcessingStatus status, IServiceScopeFactory scopeFactory)
@@ -1141,7 +1223,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .document-chat-dialog::backdrop{background:rgba(2,8,22,.72);backdrop-filter:blur(8px)}
     .progress{background:rgba(4,14,32,.7)}
     .progress>div{background:linear-gradient(90deg,#4f8cff,#9bd1ff)}
-    @media(max-width:650px){main{padding-top:14px}.site-header{padding:9px 14px}.hero{padding-bottom:4px}}
+    @media(max-width:650px){main{padding-top:14px}.site-header{padding:9px 14px}.hero{padding-bottom:4px}.upload-form{flex:1 1 100%}.upload-form input[type=file]{width:min(260px,58vw)}}
     .chat-thread{display:grid;gap:16px;align-content:start}
     .chat-turn{display:grid;gap:8px}.chat-question{margin:0;justify-self:end;max-width:85%;padding:9px 14px;border-radius:14px 14px 4px 14px;background:rgba(79,140,255,.18);border:1px solid rgba(139,190,255,.28);color:#e3efff;white-space:pre-wrap}
     .chat-answer.rendered{white-space:normal}.chat-answer.rendered>:first-child{margin-top:0}.chat-answer.rendered>:last-child{margin-bottom:0}.chat-answer p{margin:0 0 10px}.chat-answer ul,.chat-answer ol{margin:0 0 10px;padding-left:22px}.chat-answer li{margin:3px 0}.chat-answer h4{margin:12px 0 6px;font-size:.95rem}
@@ -1201,7 +1283,7 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
     :root{--input-size:15px}input,select,textarea,.edit-form input,.edit-form textarea{font-weight:400;font-size:var(--input-size)}
     :focus-visible{outline:2px solid #8bc5ff;outline-offset:2px}input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none}
-    .home-tools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0 10px}.home-tools form{margin:0}.panel-toggle{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-width:118px;padding:10px 16px;font-size:1rem}.panel-toggle-icon{width:19px;height:19px;flex:none}.panel-toggle:after{content:'';width:8px;height:8px;margin-left:4px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg);transition:transform .18s}.panel-toggle[aria-expanded=true]:after{transform:rotate(225deg)}.filter-count{min-width:20px;padding:1px 6px;border-radius:99px;background:rgba(255,255,255,.2);font-size:.76rem;text-align:center}
+    .home-tools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0 10px}.home-tools form{margin:0}.upload-form{display:flex;align-items:center;gap:8px}.upload-form input[type=file]{width:min(300px,32vw);padding:6px 8px;font-size:.82rem}.upload-form button{white-space:nowrap}.panel-toggle{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-width:118px;padding:10px 16px;font-size:1rem}.panel-toggle-icon{width:19px;height:19px;flex:none}.panel-toggle:after{content:'';width:8px;height:8px;margin-left:4px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg);transition:transform .18s}.panel-toggle[aria-expanded=true]:after{transform:rotate(225deg)}.filter-count{min-width:20px;padding:1px 6px;border-radius:99px;background:rgba(255,255,255,.2);font-size:.76rem;text-align:center}
     .chat-intro h2{margin:4px 0 6px}
     .chat-thread{max-height:min(62vh,680px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
     .chat-panel .chat-thread:has(>.chat-placeholder){display:none}
@@ -1304,6 +1386,44 @@ static string PageShell(string title, string body, bool signedIn = true) => """
     .Replace("__BODY__", body);
 
 static string H(string value) => System.Net.WebUtility.HtmlEncode(value);
+static IResult StreamPdf(string path, HttpResponse response)
+{
+    try
+    {
+        var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        response.Headers.ContentDisposition = "inline";
+        response.Headers.XContentTypeOptions = "nosniff";
+        return Results.Stream(stream, "application/pdf", enableRangeProcessing: true);
+    }
+    catch (FileNotFoundException)
+    {
+        return TypedResults.NotFound();
+    }
+    catch (DirectoryNotFoundException)
+    {
+        return TypedResults.NotFound();
+    }
+}
+
+static string SafeUploadFileName(string fileName)
+{
+    var stem = Path.GetFileNameWithoutExtension(fileName);
+    var invalid = Path.GetInvalidFileNameChars();
+    stem = new string(stem.Select(character => invalid.Contains(character) ? '_' : character).ToArray()).Trim().Trim('.');
+    if (string.IsNullOrWhiteSpace(stem)) stem = "Uploaded PDF";
+    return stem[..Math.Min(stem.Length, 120)] + ".pdf";
+}
+
+static string AvailableUploadPath(string directory, string fileName)
+{
+    var stem = Path.GetFileNameWithoutExtension(fileName);
+    var path = Path.Combine(directory, fileName);
+    for (var suffix = 2; File.Exists(path); suffix++)
+        path = Path.Combine(directory, $"{stem} ({suffix}).pdf");
+    return path;
+}
+
 static async Task WriteChatEventAsync(HttpResponse response, object value, CancellationToken cancellationToken)
 {
     await response.WriteAsync(JsonSerializer.Serialize(value) + "\n", cancellationToken);
